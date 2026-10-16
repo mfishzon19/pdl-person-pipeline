@@ -11,7 +11,7 @@ Two modes (--mode):
     10-row fake file per key, then runs the Loader. Validates the Loader,
     the COPY path and the catalog lifecycle without touching S3 or Finder.
 
-  finder   (requires a delivery in S3 — local MinIO via `make dev-up-ingester`)
+  finder   (requires a delivery in S3 — local S3 via `make dev-up-ingester`)
     Calls processing.s3_ingester.finder.discover_delivery() against S3
     for the given --delivery-date, then truncates ingestion_file rows down
     to --limit-files (default 5) before running the Loader. Validates the
@@ -21,7 +21,7 @@ Prerequisites (run from repo root, with the pdl_test conda env active):
 
   conda activate pdl_test
   make dev-up            # postgres + flyway-init (schema applied)
-  # finder mode also needs MinIO seeded with the fixture:
+  # finder mode also needs local S3 seeded with the fixture:
   make dev-up-ingester
 
 Then run one of:
@@ -30,9 +30,9 @@ Then run one of:
   DATABASE_URL='postgresql://pdl_etl:pdl_etl_dev@localhost:5432/pdl_etl' \\
        python -m processing.s3_ingester.tests.smoke_test_local
 
-  # --- finder mode (local MinIO + local Postgres)
+  # --- finder mode (local S3 + local Postgres)
   AWS_ENDPOINT_URL=http://localhost:9000 \\
-  AWS_ACCESS_KEY_ID=minio_local AWS_SECRET_ACCESS_KEY=minio_local_dev \\
+  AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \\
   DATABASE_URL='postgresql://pdl_etl:pdl_etl_dev@localhost:5432/pdl_etl' \\
        python -m processing.s3_ingester.tests.smoke_test_local \\
            --mode finder \\
@@ -208,7 +208,7 @@ def _seed_catalog_rows(db_dsn: str, source: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Mode: finder — S3 (MinIO) listing, then trim before loading
+# Mode: finder — S3 (local S3) listing, then trim before loading
 # -----------------------------------------------------------------------------
 
 def _run_finder_then_trim(
@@ -218,7 +218,7 @@ def _run_finder_then_trim(
     delivery_date: str,
     limit_files: int,
 ) -> str:
-    """Call Finder against S3 (MinIO), then trim ingestion_file rows to limit_files."""
+    """Call Finder against S3 (local S3), then trim ingestion_file rows to limit_files."""
     print("=== mode: finder — running finder ===")
     print(f"source        = {source}")
     print(f"delivery_date = {delivery_date}")
@@ -351,7 +351,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=("seeded", "finder"), default="seeded",
                         help="seeded: hand-seed catalog rows (fake S3). "
-                             "finder: run Finder against S3 / MinIO.")
+                             "finder: run Finder against S3 / local S3.")
     parser.add_argument("--source", default="pdl_full",
                         help="source name; resolves to configs/<source>.yaml")
     parser.add_argument("--delivery-date", default="2026_05_22",

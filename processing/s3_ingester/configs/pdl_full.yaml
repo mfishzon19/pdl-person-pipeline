@@ -20,7 +20,7 @@ column_list: payload
 copy_options: "(FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02')"
 
 # S3 bucket PDL delivers into. PLACEHOLDER — set it to your delivery bucket.
-# For local runs use pdl_full_local.yaml (MinIO bucket pdl-ingest-local),
+# For local runs use pdl_full_local.yaml (local S3 bucket pdl-ingest-local),
 # which is what `make ingest-pdl` runs.
 bucket: pdl-ingest-prod
 region: us-east-1

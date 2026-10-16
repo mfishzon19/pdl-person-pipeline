@@ -24,7 +24,7 @@
 #   3. the committed FULLY SYNTHETIC sample in infra/local/fixtures/
 #      (built by generate-sample-fixture.py — no real people or companies)
 #   4. nothing found → skip (exit 0)
-# Steps 2–3 leave the file in the cache, where minio-init picks it up.
+# Steps 2–3 leave the file in the cache, where s3-init picks it up.
 # The cache wins on re-runs: `make dev-reset` clears it, so a new
 # FIXTURE_URL or a regenerated committed sample takes effect after a reset.
 
@@ -60,7 +60,7 @@ NOTICE: no PDL fixture available — skipping fixture load.
   No cached file at infra/local/fixtures-cache/${FIXTURE_FILE}, no usable
   FIXTURE_URL, and no committed sample at infra/local/fixtures/${FIXTURE_FILE}
   (FIXTURE_VERSION=${FIXTURE_VERSION}). Schema migrations applied
-  successfully; raw.pdl_person will just be empty (and minio-init will
+  successfully; raw.pdl_person will just be empty (and s3-init will
   create an empty bucket).
 
 To load sample data, either:
@@ -120,7 +120,7 @@ fi
 # Step 1b — skip direct-load if the ingester profile is active.
 #
 # When SKIP_RAW_LOAD=1, this script only CACHES the fixture in the
-# shared cache directory (so minio-init can upload it to MinIO). The
+# shared cache directory (so s3-init can upload it to local S3). The
 # ingester engineer then runs `make ingest-pdl`, which exercises
 # s3_ingester.run end-to-end and populates raw.pdl_person via the real
 # Finder → Loader → Projection chain. Set by `make dev-up-ingester`.

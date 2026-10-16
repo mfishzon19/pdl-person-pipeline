@@ -10,7 +10,7 @@ delivery; also runnable directly via the CLI below for ad-hoc single-file
 testing.
 
 Load path: the file's bytes are fetched from S3 with boto3 (honors
-AWS_ENDPOINT_URL, so local MinIO works unchanged), gunzipped if needed, and
+AWS_ENDPOINT_URL, so local S3 works unchanged), gunzipped if needed, and
 loaded into the target table with `COPY ... FROM STDIN` on the same
 psycopg2 connection. No server-side Postgres S3 extension is required. See
 docs/design/02_pipeline_design.md Section 6.
@@ -23,7 +23,7 @@ Spec:
 Local CLI:
     DATABASE_URL='postgresql://pdl_etl:pdl_etl_dev@localhost:5432/pdl_etl' \\
     AWS_ENDPOINT_URL=http://localhost:9000 \\
-    AWS_ACCESS_KEY_ID=minio_local AWS_SECRET_ACCESS_KEY=minio_local_dev \\
+    AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \\
     python -m processing.s3_ingester.file_ingester \\
         --ingestion-file-id <uuid> \\
         --schema raw --table pdl_person \\
@@ -284,9 +284,9 @@ def _copy_from_s3(
       - Return SELECT COUNT(*) from the target
 
     The bytes are fetched from S3 via boto3 (which honors AWS_ENDPOINT_URL
-    → MinIO for local runs). Gzip is detected by key suffix or the object's
-    Content-Encoding header, because MinIO uploads via `mc cp` don't always
-    set Content-Encoding.
+    → local S3 for local runs). Gzip is detected by key suffix or the object's
+    Content-Encoding header, because uploads (e.g. s3-init's boto3
+    `upload_file`) don't always set Content-Encoding.
 
     Trade-off: the whole object is downloaded into memory before the COPY,
     so peak RAM is bounded by the largest single file (decompressed). PDL

@@ -31,11 +31,11 @@ Failure handling:
   projection-success can be recovered by re-running just `run_pdl_projection`
   (or the whole `run.py` — Loader will see no pending files and short-circuit).
 
-Local CLI (against the docker-compose Postgres + MinIO):
+Local CLI (against the docker-compose Postgres + local S3):
 
     DATABASE_URL='postgresql://pdl_etl:pdl_etl_dev@localhost:5432/pdl_etl' \\
     AWS_ENDPOINT_URL=http://localhost:9000 \\
-    AWS_ACCESS_KEY_ID=minio_local AWS_SECRET_ACCESS_KEY=minio_local_dev \\
+    AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \\
     python -m processing.s3_ingester.run \\
         --source pdl_full_local \\
         --delivery-date 2026_05_22 \\

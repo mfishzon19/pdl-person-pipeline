@@ -9,6 +9,6 @@ Design specs for the PDL pipeline (how it is built). Pair with [`../requirements
 - [18_pdl_api_generic_caller.md](18_pdl_api_generic_caller.md) — generic PDL API caller: `PDLCaller` / `BulkPDLCaller`, company enrichment and company / location / school cleaners, queue / view / audit tables, credit caps, crash recovery.
 - [21_cleansing_layer_design.md](21_cleansing_layer_design.md) — cleansing layer design: cleansing classes, casing convention, function library, `_cleaned` model shape, and how each routine in [`../pdl_data_cleansing/`](../pdl_data_cleansing/) becomes a pipeline step.
 - [common_libraries.md](common_libraries.md) — `processing.common.*` modules: db, aws (S3 / Secrets Manager), PDL HTTP client, preflight checks, logging setup.
-- [local-dev-design.md](local-dev-design.md) — the local environment: Docker Compose services (Postgres, Flyway, fixture load, MinIO), the `pdl_test` conda env, make targets, env vars, troubleshooting.
+- [local-dev-design.md](local-dev-design.md) — the local environment: Docker Compose services (Postgres, Flyway, fixture load, local S3 via moto server), the `pdl_test` conda env, make targets, env vars, troubleshooting.
 
 Numbers reflect creation order, not reading order. Start with `02_pipeline_design.md`.

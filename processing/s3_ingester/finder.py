@@ -61,7 +61,7 @@ Local CLI
 
     DATABASE_URL='postgresql://pdl_etl:pdl_etl_dev@localhost:5432/pdl_etl' \\
     AWS_ENDPOINT_URL=http://localhost:9000 \\
-    AWS_ACCESS_KEY_ID=minio_local AWS_SECRET_ACCESS_KEY=minio_local_dev \\
+    AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local \\
     python -m processing.s3_ingester.finder \\
         --source pdl_full_local \\
         --delivery-date 2026_05_22

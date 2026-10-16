@@ -1,6 +1,6 @@
 # processing/s3_ingester/
 
-Pipeline step 1: config-driven ingestion of PDL Person deliveries from S3 (or local MinIO) into `raw.*`, with the identity-ledger projection of PDL's delta files. Design: [`docs/design/02_pipeline_design.md`](../../docs/design/02_pipeline_design.md) Section 6 (ingester) and Section 10 (catalog logging).
+Pipeline step 1: config-driven ingestion of PDL Person deliveries from S3 (or the local S3 stand-in, moto server) into `raw.*`, with the identity-ledger projection of PDL's delta files. Design: [`docs/design/02_pipeline_design.md`](../../docs/design/02_pipeline_design.md) Section 6 (ingester) and Section 10 (catalog logging).
 
 ## Architecture: Finder → Loader → per-file primitive → PDL projection
 
@@ -10,7 +10,7 @@ Pipeline step 1: config-driven ingestion of PDL Person deliveries from S3 (or lo
 - **`pdl_projection_runner.py`** — runs `SELECT raw.project_pdl_deltas(:delivery_date)`, which projects the merged / deleted / opted-out delta files into the `catalog` identity ledger (`pdl_id_aliases`, `pdl_inactive`, `merge_events`). The projection logic lives in the hand-authored repeatable migration `R__function_project_pdl_deltas.sql`, not in Python — Finder and Loader stay generic.
 - **`run.py`** — chains Finder → Loader → projection for one delivery in one process, and finalizes `pdl_delivery`.
 
-**Load path.** Python fetches each file's bytes from S3 / MinIO (boto3 honours `AWS_ENDPOINT_URL`), decompresses `.gz` by key suffix or `Content-Encoding`, and loads them into the leaf with `COPY ... FROM STDIN` on the same connection. No Postgres-side S3 extension is involved. Peak memory is bounded by the largest single decompressed file.
+**Load path.** Python fetches each file's bytes from S3 (boto3 honours `AWS_ENDPOINT_URL`), decompresses `.gz` by key suffix or `Content-Encoding`, and loads them into the leaf with `COPY ... FROM STDIN` on the same connection. No Postgres-side S3 extension is involved. Peak memory is bounded by the largest single decompressed file.
 
 **Idempotency.** Re-running a delivery is safe: every file is TRUNCATE + COPY into its own leaf, `replace_strategy: full` clears the parents first, and the projection is `ON CONFLICT DO NOTHING` keyed on the delivery date. A re-run of `run.py` starts a new `ingestion_run`; running the Loader against an existing `ingestion_run_id` loads only files still `pending`.
 
@@ -74,8 +74,8 @@ The lifecycle helper is a generic state machine; the closure carries all the con
 | Symptom | Cause |
 |---|---|
 | `RuntimeError: ingestion_run X has no pending ingestion_file rows` | The `ingestion_file` INSERTs were rolled back, or the Loader is pointed at a different `ingestion_run_id`. |
-| Finder fails: sentinel not found | The delivery's `COMPLETED` object isn't there yet (or wrong `--delivery-date` / bucket). With MinIO, run `make dev-up-ingester` to seed the fixture. |
-| `NoSuchBucket` / connection refused on `localhost:9000` | MinIO not running, or `AWS_ENDPOINT_URL` not set for a local run. |
+| Finder fails: sentinel not found | The delivery's `COMPLETED` object isn't there yet (or wrong `--delivery-date` / bucket). With local S3, run `make dev-up-ingester` to seed the fixture (local S3 is in-memory, so re-run it after the `s3` container restarts). |
+| `NoSuchBucket` / connection refused on `localhost:9000` | Local S3 (`s3` service) not running, or `AWS_ENDPOINT_URL` not set for a local run. |
 | Partition overlap error creating a leaf | `raw.pdl_person` was pre-populated by `fixture-load`; use `make dev-up-ingester` (keeps raw empty) or `make dev-reset`. |
 | `database files are incompatible with server` (Postgres startup) | Old volume from another Postgres major version. `make dev-reset`. |
 
@@ -84,8 +84,8 @@ The lifecycle helper is a generic state machine; the closure carries all the con
 From the repo root in the `pdl_test` conda env with the local stack up:
 
 ```bash
-make dev-up-ingester    # postgres + flyway + MinIO seeded with the sanitized fixture, raw.* empty
-make ingest-pdl         # run.py against MinIO (DELIVERY_DATE=yyyy_mm_dd to override)
+make dev-up-ingester    # postgres + flyway + local S3 seeded with the sanitized fixture, raw.* empty
+make ingest-pdl         # run.py against local S3 (DELIVERY_DATE=yyyy_mm_dd to override)
 ```
 
 Or call the modules directly (`set -a; source .env; set +a` first — see `.env.example`):
@@ -106,7 +106,7 @@ python -m processing.s3_ingester.pdl_projection_runner \
 
 `run.py` / `finder.py` also accept an optional `--pipeline-version` (recorded on `catalog.pipeline_run`, default `local`); pin it to a git SHA or release tag when a run should be traceable to a code version.
 
-To read a real PDL delivery bucket instead of MinIO: set the bucket in `configs/pdl_full.yaml`, unset `AWS_ENDPOINT_URL`, supply AWS credentials (or `AWS_PROFILE`) with read access, and use `--source pdl_full`.
+To read a real PDL delivery bucket instead of local S3: set the bucket in `configs/pdl_full.yaml`, unset `AWS_ENDPOINT_URL`, supply AWS credentials (or `AWS_PROFILE`) with read access, and use `--source pdl_full`.
 
 ## Adding a new source
 
@@ -120,4 +120,4 @@ To read a real PDL delivery bucket instead of MinIO: set the bucket in `configs/
 pytest processing/s3_ingester/tests/
 ```
 
-S3 and PDL are mocked; integration tests skip unless `DATABASE_URL` points at a local Postgres (see [CLAUDE.md](../../CLAUDE.md)). [`tests/smoke_test_local.py`](tests/smoke_test_local.py) is a standalone end-to-end script (seeded mode needs only Postgres; finder mode needs MinIO) — its docstring lists prerequisites and expected output.
+S3 and PDL are mocked; integration tests skip unless `DATABASE_URL` points at a local Postgres (see [CLAUDE.md](../../CLAUDE.md)). [`tests/smoke_test_local.py`](tests/smoke_test_local.py) is a standalone end-to-end script (seeded mode needs only Postgres; finder mode needs local S3 via `make dev-up-ingester`) — its docstring lists prerequisites and expected output.

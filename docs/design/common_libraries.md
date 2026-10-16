@@ -1,7 +1,7 @@
 # Common Libraries — design
 
 **Audience:** contributors writing code in `processing/`
-**Scope:** the `processing.common.*` packages — the seam between pipeline code and external dependencies (Postgres driver, AWS SDK for S3 / MinIO, PDL HTTP client) plus shared delivery pre-flight checks and logging setup.
+**Scope:** the `processing.common.*` packages — the seam between pipeline code and external dependencies (Postgres driver, AWS SDK for S3, PDL HTTP client) plus shared delivery pre-flight checks and logging setup.
 
 For a developer-facing quickstart (import names + minimal usage), see `processing/common/README.md`. This document captures *why* the seam exists, the error model, and per-module specifics.
 
@@ -40,7 +40,7 @@ processing/common/
 ├── pdl/               # PDL HTTP client
 │   ├── __init__.py
 │   └── client.py      # pdl_api_call, call_pdl_with_retry
-└── preflight/         # delivery readiness checks against an S3 / MinIO prefix
+└── preflight/         # delivery readiness checks against an S3 prefix
     ├── __init__.py
     ├── checks.py      # check_completed_sentinel, list_partition_ids, verify_*_encoding
     └── tests/
@@ -171,7 +171,7 @@ Wrap writes in `transaction(conn)`.
 
 ## `processing.common.aws`
 
-The place pipeline code talks to S3 (real AWS S3 for PDL deliveries, or local MinIO) and, optionally, Secrets Manager.
+The place pipeline code talks to S3 (real AWS S3 for PDL deliveries, or the local S3 stand-in, moto server) and, optionally, Secrets Manager.
 
 ### Public API
 
@@ -199,11 +199,11 @@ Callers should:
 - Catch `TransientError` and retry with backoff if the work is idempotent.
 - Catch `AWSOpsError` as the defensive default.
 
-### Credentials and endpoint override (MinIO)
+### Credentials and endpoint override (local S3)
 
 Credentials come from the standard AWS credential chain — set `AWS_PROFILE` (or the usual `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) to read real PDL deliveries from S3.
 
-For local MinIO, `boto3` honors the `AWS_ENDPOINT_URL` env var. The Makefile ingester targets export `AWS_ENDPOINT_URL=http://localhost:9000` (plus the MinIO credentials) for the host-side ingester run. The `_client()` helper just calls `boto3.client(...)`, so the same code reads from MinIO or S3 with no code-path divergence. See [`local-dev-design.md`](local-dev-design.md).
+For local S3 (moto server, `s3` compose service), `boto3` honors the `AWS_ENDPOINT_URL` env var. The Makefile ingester targets export `AWS_ENDPOINT_URL=http://localhost:9000` (plus placeholder credentials `local` / `local`; moto accepts any) for the host-side ingester run. The `_client()` helper just calls `boto3.client(...)`, so the same code reads from local S3 or real S3 with no code-path divergence. See [`local-dev-design.md`](local-dev-design.md).
 
 ### What's NOT in the public API
 
@@ -258,7 +258,7 @@ Not implemented: an account-wide throttle across endpoints (rate pacing is per c
 
 ## `processing.common.preflight`
 
-Delivery readiness checks against an S3 / MinIO prefix, designed for any S3-delivered source. Each function takes a boto3 S3 client as its first argument.
+Delivery readiness checks against an S3 prefix, designed for any S3-delivered source. Each function takes a boto3 S3 client as its first argument.
 
 | Name | Purpose |
 |---|---|

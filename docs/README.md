@@ -6,7 +6,7 @@ Documentation for the local PDL pipeline. The project front page with quickstart
 
 | Step | What happens | Read |
 |---|---|---|
-| 1. Ingest | PDL Person deliveries from S3 / MinIO → `raw.*`; delta files → `catalog` identity ledger | [design/02 §5–6, §9–10](design/02_pipeline_design.md), [processing/s3_ingester](../processing/s3_ingester/README.md), [requirements/01](requirements/01_pipeline_requirements.md) |
+| 1. Ingest | PDL Person deliveries from S3 (or local S3) → `raw.*`; delta files → `catalog` identity ledger | [design/02 §5–6, §9–10](design/02_pipeline_design.md), [processing/s3_ingester](../processing/s3_ingester/README.md), [requirements/01](requirements/01_pipeline_requirements.md) |
 | 2. Parse | dbt staging: `staging.pdl_person_*_parsed` → `_unique` | [design/15](design/15_pdl_staging_design.md), [design/16](design/16_dbt_pipeline_layers.md) |
 | 3. PDL API | Company enrichment + company / location / school cleaners → `pdl_api.*` → `staging.pdl_api_company_parsed` | [design/18](design/18_pdl_api_generic_caller.md), [processing/pdl_api](../processing/pdl_api/README.md) |
 | 4. Model | `ref.*` + `integration.*` — the data model | [data_model/](data_model/README.md), [decisions/](decisions/README.md) |

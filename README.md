@@ -2,12 +2,12 @@
 
 A local data pipeline for **People Data Labs (PDL)** Person data. It ingests PDL's monthly bulk deliveries from S3, parses the nested JSON with dbt into a normalized relational model, resolves and enriches companies, locations and schools through the PDL API, and tracks PDL's identity events (merges, deletions, opt-outs) across deliveries. A set of data-cleansing routines is prototyped on top.
 
-Everything runs on a laptop: Postgres, Flyway and an optional MinIO (S3 stand-in) in Docker Compose; the Python ingester, the PDL API callers and dbt in a conda env.
+Everything runs on a laptop: Postgres, Flyway and an optional local S3 stand-in (moto server, `s3` service) in Docker Compose; the Python ingester, the PDL API callers and dbt in a conda env.
 
 ## How it works
 
 ```
- PDL Person delivery (S3 or local MinIO)
+ PDL Person delivery (S3 or local S3)
    {date}/data/part-*.csv.gz  +  delta_data/{MERGED,DELETED,OPTED_OUT}_RECORDS_*  +  COMPLETED
         │
         │ 1. INGEST     processing/s3_ingester                    make ingest-pdl
@@ -50,13 +50,12 @@ Known gaps are listed in [design/02 §12](docs/design/02_pipeline_design.md#12-o
 
 ## Quickstart
 
-Prerequisites: Docker (Docker Desktop or Colima, with the `docker compose` plugin), Conda (Miniconda), `make`.
+Prerequisites: Docker (Docker Desktop or Colima, with the `docker compose` plugin), Conda (Miniconda), `make`. With Colima, clone under your home directory (Colima only shares `$HOME` with containers by default).
 
 ```bash
 # One-time
 conda env create -f environment.yml
 cp .env.example .env                                              # local defaults; add PDL_API_KEY only to call PDL
-cp processing/dbt/profiles.yml.example processing/dbt/profiles.yml
 
 # Each session
 conda activate pdl_test
@@ -65,8 +64,8 @@ set -a; source .env; set +a
 make dev-up            # Postgres + Flyway migrations + fixture load into raw.pdl_person
 make dbt-pdl           # steps 2 + 4: dbt build --select tag:pdl+
 
-# Or exercise the real ingester against MinIO
-make dev-up-ingester   # + MinIO with the fixture uploaded as a delivery; raw.* left empty
+# Or exercise the real ingester against local S3
+make dev-up-ingester   # + local S3 with the fixture uploaded as a delivery; raw.* left empty
 make pipeline-pdl      # ingest-pdl (step 1) + dbt-pdl
 ```
 
@@ -81,8 +80,8 @@ Connect any Postgres client to `postgresql://pdl_etl:pdl_etl_dev@localhost:5432/
 | Target | What it does |
 |---|---|
 | `make dev-up` | Start Postgres, apply Flyway migrations, load the fixture into `raw.pdl_person` |
-| `make dev-up-ingester` | Same, but leave `raw` empty and start MinIO (bucket `pdl-ingest-local`) seeded with the fixture as a delivery |
-| `make ingest-pdl` | Run the ingester against MinIO (`DELIVERY_DATE=yyyy_mm_dd` to override) |
+| `make dev-up-ingester` | Same, but leave `raw` empty and start local S3 (bucket `pdl-ingest-local`) seeded with the fixture as a delivery. Local S3 is in-memory with no web console; re-run this after restarting it |
+| `make ingest-pdl` | Run the ingester against local S3 (`DELIVERY_DATE=yyyy_mm_dd` to override) |
 | `make dbt-pdl` | `dbt build --select tag:pdl+` — PDL staging and everything downstream |
 | `make dbt-integration`, `make dbt-<tag>` | Build any dbt tag and its descendants |
 | `make pipeline-pdl` | `ingest-pdl` then `dbt-pdl` |
@@ -121,7 +120,7 @@ PDL and S3 are mocked in every unit and integration test. The live smoke tests i
 │   ├── dbt/                    Steps 2 + 4: dbt project (staging → ref → integration)
 │   └── tests/                  Cross-component tests
 ├── infra/local/                Compose helper scripts, committed synthetic fixture, fixture cache, Postgres init, pgAdmin server definition
-├── docker-compose.yml          postgres, flyway-init, fixture-load; profile `ingester`: minio, minio-init
+├── docker-compose.yml          postgres, flyway-init, fixture-load; profile `ingester`: s3, s3-init
 ├── Makefile                    Local entry points
 ├── environment.yml             Conda env `pdl_test`
 ├── pyproject.toml              ruff / pytest / sqlfluff config

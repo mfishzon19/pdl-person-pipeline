@@ -1,11 +1,11 @@
 # pdl_full_local — local-dev twin of pdl_full.yaml.
 #
-# Identical contract; the ONLY difference is `bucket:` points at the MinIO
+# Identical contract; the ONLY difference is `bucket:` points at the local S3
 # bucket the local docker-compose stack creates (`pdl-ingest-local`)
 # instead of the real delivery bucket. This file is consumed by
 # `make ingest-pdl` / `make pipeline-pdl`, which run the ingester on the
 # host with AWS_ENDPOINT_URL=http://localhost:9000 so boto3 resolves to
-# local MinIO instead of real S3.
+# the local S3 stand-in (moto server) instead of real S3.
 #
 # Keep all NON-bucket keys (column_list, copy_options, partition_*,
 # replace_strategy, sentinel, file_groups) byte-identical to pdl_full.yaml.
@@ -28,7 +28,7 @@ replace_strategy: full
 sentinel:
   key_pattern: "{delivery_date}/COMPLETED"
 
-# Only `pdl_data` is required. Local MinIO is seeded with a single part-00000
+# Only `pdl_data` is required. Local S3 is seeded with a single part-00000
 # under data/ — no delta files. Keeping the optional delta groups defined so
 # this YAML stays a true mirror of pdl_full.yaml (just swap the bucket).
 #

@@ -3,7 +3,7 @@
 Two tests, both marked `tier1` and `integration`. They run against a
 real local Postgres (the docker-compose one, after flyway-init). S3 is
 faked: `file_ingester.boto3.client` is patched to serve a gzipped
-10-row PDL-shaped file for every key, so no MinIO is needed. They skip
+10-row PDL-shaped file for every key, so no local S3 is needed. They skip
 on their own when DATABASE_URL isn't set (see conftest.py).
 
   1. End-to-end happy path. We hand-seed a `pipeline_run`, an

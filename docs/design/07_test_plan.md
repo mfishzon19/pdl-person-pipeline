@@ -6,7 +6,7 @@
 ## Ground rules
 
 - **Never call PDL APIs in tests.** Every PDL call is mocked (patch `processing.common.pdl.client.pdl_api_call`). The only exception is the opt-in `pdl_smoke` marker (below), which never runs by default.
-- **No AWS credentials or network needed.** S3 reads are mocked (boto3 `get_object` patched to return fixture bytes) or served by local MinIO; the default suite must pass offline.
+- **No AWS credentials or network needed.** S3 reads are mocked (boto3 `get_object` patched to return fixture bytes) or served by the local S3 stand-in (moto server); the default suite must pass offline.
 - **Integration tests use local Postgres** from Docker Compose (`make dev-up`), never a shared database.
 
 ## Conventions
@@ -68,7 +68,7 @@ make dev-up                           # postgres + flyway-init + fixture-load
 export DATABASE_URL='postgresql://pdl_etl:pdl_etl_dev@localhost:5432/pdl_etl'
 ```
 
-For tests or the smoke script that read real objects through the Finder, also run `make dev-up-ingester` (MinIO, bucket `pdl-ingest-local`) and set `AWS_ENDPOINT_URL` to the MinIO endpoint.
+For tests or the smoke script that read real objects through the Finder, also run `make dev-up-ingester` (local S3, bucket `pdl-ingest-local`) and set `AWS_ENDPOINT_URL=http://localhost:9000`.
 
 ---
 
@@ -195,7 +195,7 @@ Add after Tier 1 lands and a few real PDL deliveries have gone through. Tag with
 - [ ] Concurrent vs sequential loads reach the same final state
 - [ ] Re-running the loader when some files are already `'success'` reprocesses only `'pending'` rows
 - [ ] Load raises on file 2 of 3 → file 1 success, file 2 failed, file 3 pending; `ingestion_run` failed
-- [ ] Finder against `moto`-backed (or MinIO) S3: missing sentinel → `RuntimeError`, no catalog rows written
+- [ ] Finder against `moto`-backed S3 (in-process or the local moto server): missing sentinel → `RuntimeError`, no catalog rows written
 - [ ] Finder happy path with 5 fake files → 1 `pipeline_run` + 1 `ingestion_run` + 5 `ingestion_file` + 1 `pdl_delivery`
 
 ### `pdl_api`
@@ -213,7 +213,7 @@ Tag with `@pytest.mark.tier3`. Probably not needed until several people work on 
 - [ ] Multi-page S3 list pagination (≥2 pages)
 - [ ] Field-by-field type checks in `_load_finder_config` (e.g. `file_groups[].optional` must be bool)
 - [ ] Integration: re-run `discover_delivery` for the same date updates `pdl_delivery` via ON CONFLICT
-- [ ] Integration: Finder against a full real delivery layout in MinIO (usually covered by the smoke script)
+- [ ] Integration: Finder against a full real delivery layout in local S3 (usually covered by the smoke script)
 - [ ] Concurrent `_truncate_target_tables` races
 - [ ] File group `key_pattern` missing its named group → clean error
 - [ ] Empty-string `partition_value` from the regex → clean error
@@ -224,7 +224,7 @@ Tag with `@pytest.mark.tier3`. Probably not needed until several people work on 
 ## Out of scope
 
 - Real (non-mocked) PDL API calls, except `pdl_smoke`.
-- Real S3 buckets: exercised manually with the smoke script or `make ingest-pdl` against MinIO.
+- Real S3 buckets: exercised manually with the smoke script or `make ingest-pdl` against local S3.
 - argparse argument-definition validation (tests the stdlib, not our code).
 - Performance / load tests.
 

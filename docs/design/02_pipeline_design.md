@@ -23,14 +23,14 @@ _Design rationale and technical specifications. Source of truth for **how** the 
 
 ## 1. Scope and Pipeline Overview
 
-The pipeline ingests **PDL (People Data Labs) Person** bulk deliveries, parses them into a normalized relational model, enriches and cleans company / location / school references through the **PDL API**, and applies cleansing routines on top. Everything runs **locally**: Postgres and Flyway in Docker Compose, optional MinIO standing in for S3, and the Python ingester, PDL API callers and dbt run on the host in a conda env, driven by `make` targets.
+The pipeline ingests **PDL (People Data Labs) Person** bulk deliveries, parses them into a normalized relational model, enriches and cleans company / location / school references through the **PDL API**, and applies cleansing routines on top. Everything runs **locally**: Postgres and Flyway in Docker Compose, an optional local S3 stand-in (moto server, `s3` service), and the Python ingester, PDL API callers and dbt run on the host in a conda env, driven by `make` targets.
 
 PDL is the only source. The model keeps a `source` column where it matters so a second source could be added later without a schema redesign, but nothing in the current build reconciles multiple sources.
 
 ### The five-step flow
 
 ```
- S3 / MinIO  (PDL Person delivery: data/ + delta_data/ + COMPLETED)
+ S3 / local S3  (PDL Person delivery: data/ + delta_data/ + COMPLETED)
      │
      ▼
  1. INGEST  — processing/s3_ingester (Finder → Loader → PDL projection)
@@ -54,7 +54,7 @@ PDL is the only source. The model keeps a `source` column where it matters so a 
 
 | Step | Code | Reads | Writes | Make target |
 |---|---|---|---|---|
-| 1. Ingest | `processing/s3_ingester/run.py` | S3 / MinIO | `raw.*`, `catalog.*` | `make ingest-pdl` |
+| 1. Ingest | `processing/s3_ingester/run.py` | S3 / local S3 | `raw.*`, `catalog.*` | `make ingest-pdl` |
 | 2. Parse | `processing/dbt/models/staging/pdl_person/` | `raw.pdl_person`, `catalog.pdl_id_aliases` | `staging.pdl_person_*` | `make dbt-pdl` (with step 4) |
 | 3. PDL API | `processing/pdl_api/` + `processing/dbt/models/staging/pdl_api/` | `pdl_api.*_input_list`, PDL API | `pdl_api.*_call`, `staging.pdl_api_company_parsed` | `make clean-pdl`, `make enrich-pdl SOURCE_LIST=x MAX_CREDITS=n`, then `dbt build --select pdl_api_company_parsed+` |
 | 4. Model | `processing/dbt/models/ref/`, `processing/dbt/models/integration/` | `staging.*` | `ref.*`, `integration.*` | `make dbt-pdl` (downstream of `tag:pdl`) |
@@ -210,7 +210,7 @@ Credentials: `PDL_API_KEY` from the environment / local `.env`. Tests never call
 | Schema migrations | Flyway, applied by the one-shot `flyway-init` compose service (Section 11) |
 | Transformation | dbt Core, run on the host in the `pdl_test` conda env (`make dbt-pdl`) |
 | Ingestion + API calls | Python, run on the host in the `pdl_test` conda env |
-| Object storage | S3 for real PDL deliveries (standard AWS credential chain / `AWS_PROFILE`); MinIO locally (compose profile `ingester`, bucket `pdl-ingest-local`) |
+| Object storage | S3 for real PDL deliveries (standard AWS credential chain / `AWS_PROFILE`); local S3 stand-in (moto server; compose profile `ingester`, bucket `pdl-ingest-local`, in-memory) |
 | Running steps | `make` targets (`ingest-pdl`, `dbt-pdl`, `pipeline-pdl`) |
 | Secrets | Environment variables / local gitignored `.env` (`DATABASE_URL`, `PDL_API_KEY`, AWS credentials) |
 
@@ -219,7 +219,7 @@ Bring-up:
 ```bash
 conda env create -f environment.yml   # once; creates the pdl_test env
 make dev-up              # postgres + flyway-init + fixture-load (sanitized PDL fixture into raw)
-make dev-up-ingester     # + MinIO seeded with a fixture delivery; raw.pdl_person left empty for the ingester
+make dev-up-ingester     # + local S3 seeded with a fixture delivery; raw.pdl_person left empty for the ingester
 make pipeline-pdl        # ingest-pdl + dbt-pdl
 make dev-down            # stop, keep volumes;  make dev-reset  to drop volumes
 ```
@@ -240,7 +240,7 @@ A schema change is a migration in layer 2, not a coordinated rewrite across Pyth
 
 ```
 # PDL Person — per-delivery prefix; data/ and delta_data/ underneath
-s3://<pdl-bucket>/                            # local: s3://pdl-ingest-local/ on MinIO
+s3://<pdl-bucket>/                            # local: s3://pdl-ingest-local/ on local S3
   <delivery_date>/                            # yyyy_mm_dd, e.g. 2026_04_22
     data/                                     # full snapshot
       part-NNNNN.csv.gz                       # hundreds of parts; each line = one JSON object
@@ -260,7 +260,7 @@ s3://<pdl-bucket>/                            # local: s3://pdl-ingest-local/ on
 Notes:
 - The first delivery has `data/` only; `delta_data/` begins from the second delivery.
 - Delta folder names carry a schema-version suffix (`_V_NN.N`). The ingester regex-matches it; the version doesn't change behavior because deltas contain only pdl_ids.
-- The delivery bucket name is set in `configs/pdl_full.yaml`; `configs/pdl_full_local.yaml` is the byte-identical twin pointing at MinIO.
+- The delivery bucket name is set in `configs/pdl_full.yaml`; `configs/pdl_full_local.yaml` is the byte-identical twin pointing at local S3.
 
 ---
 
@@ -308,7 +308,7 @@ COMMIT;
 BEGIN;
   TRUNCATE raw.pdl_person_p_42;
   COPY raw.pdl_person_p_42 (payload) FROM STDIN WITH (FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02');
-      -- bytes fetched from S3/MinIO with boto3, gunzipped in Python, streamed over the connection
+      -- bytes fetched from S3 with boto3, gunzipped in Python, streamed over the connection
   SELECT count(*) FROM raw.pdl_person_p_42;
   UPDATE catalog.ingestion_file SET status='success', row_count=..., load_ended_at=now() WHERE ...;
 COMMIT;
@@ -379,7 +379,7 @@ A **single framework** that reads a per-source YAML config and handles every S3-
 
 - **Finder (`processing/s3_ingester/finder.py`)** — per delivery, source-aware. Checks the sentinel, lists S3 per the `file_groups` in `configs/<source>.yaml` (regex-matched per key with a named partition-value group), then in **one transaction** INSERTs `catalog.pipeline_run` (unless a pre-minted id was passed), one `catalog.ingestion_run`, one `catalog.ingestion_file` row per file (`status='pending'`), and, for PDL, the `catalog.pdl_delivery` row (`status='received'`). Returns `ingestion_run_id`. The Finder does not load data and does not write to S3.
 - **Loader (`processing/s3_ingester/delivery_loader.py`)** — per delivery, source-agnostic. Applies `replace_strategy`, reads the pending `ingestion_file` rows, loads them sequentially or through a thread pool (`--max-concurrency`), and finalizes `catalog.ingestion_run` with status and totals.
-- **Ingester (`processing/s3_ingester/file_ingester.py`)** — per-file primitive. `ingest_file(...)` creates the partition leaf if needed, fetches the object with boto3 (honoring `AWS_ENDPOINT_URL`, so MinIO works unchanged), gunzips it, runs `TRUNCATE` + `COPY ... FROM STDIN`, counts rows, and manages the `ingestion_file` status lifecycle.
+- **Ingester (`processing/s3_ingester/file_ingester.py`)** — per-file primitive. `ingest_file(...)` creates the partition leaf if needed, fetches the object with boto3 (honoring `AWS_ENDPOINT_URL`, so local S3 works unchanged), gunzips it, runs `TRUNCATE` + `COPY ... FROM STDIN`, counts rows, and manages the `ingestion_file` status lifecycle.
 - **PDL projection (`processing/s3_ingester/pdl_projection_runner.py`)** — wraps `SELECT raw.project_pdl_deltas(:delivery_date)` and returns its jsonb summary.
 - **Entry point (`processing/s3_ingester/run.py`)** — chains Finder → Loader → PDL projection → `pdl_delivery` finalize in one process. Each module also has its own CLI for re-running a single step.
 
@@ -387,7 +387,7 @@ A **single framework** that reads a per-source YAML config and handles every S3-
 
 The only load path is a client-side COPY:
 
-1. boto3 `get_object` on the S3 / MinIO key.
+1. boto3 `get_object` on the S3 key.
 2. Decompress in Python if the key ends in `.gz` or the object has `Content-Encoding: gzip`.
 3. `TRUNCATE` the target leaf (encapsulated in the primitive, so a missed TRUNCATE can't silently turn a load into an append).
 4. `COPY <leaf> (<column_list>) FROM STDIN WITH <copy_options>` on the same psycopg2 connection.
@@ -402,7 +402,7 @@ Trade-off: each object is held in memory before the COPY. PDL part files are ten
 ### Running it
 
 ```bash
-make dev-up-ingester     # MinIO + fixture delivery in s3://pdl-ingest-local/
+make dev-up-ingester     # local S3 + fixture delivery in s3://pdl-ingest-local/
 make ingest-pdl          # python -m processing.s3_ingester.run --source pdl_full_local --delivery-date <yyyy_mm_dd> --max-concurrency 2
 ```
 

@@ -9,7 +9,7 @@ Two patterns covered:
     get_object_bytes(bucket, key, region) -> bytes
 
 Endpoint override: boto3 honors the AWS_ENDPOINT_URL env var, so the
-local-dev MinIO docker stack (export AWS_ENDPOINT_URL=http://localhost:9000,
+local-dev S3 stand-in (moto server, compose `s3` service; export AWS_ENDPOINT_URL=http://localhost:9000,
 as the Makefile ingester targets do) works through these helpers without
 code changes.
 """

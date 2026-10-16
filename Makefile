@@ -1,7 +1,7 @@
 # pdl-test — Makefile
 #
 # Operator-facing entry points for the local dev environment.
-# Infrastructure (Postgres, Flyway, MinIO) runs in docker compose; the
+# Infrastructure (Postgres, Flyway, a local S3 stand-in) runs in docker compose; the
 # Python ingester, PDL API callers, dbt, tests and lint run on the host in
 # the `pdl_test` conda env. Activate it first:
 #
@@ -10,7 +10,7 @@
 #
 # Quick start:
 #   make dev-up               # core: postgres + flyway + fixture
-#   make dev-up-ingester      # + minio (for s3_ingester e2e)
+#   make dev-up-ingester      # + local S3 (for s3_ingester e2e)
 #   make ingest-pdl           # Python ingester only (Finder→Loader→Projection)
 #   make dbt-pdl              # dbt only (build tag:pdl+ downstream)
 #   make pipeline-pdl         # full chain: ingest-pdl + dbt-pdl
@@ -35,18 +35,16 @@ PG_DB       ?= pdl_etl
 PG_HOST     ?= localhost
 PG_PORT     ?= 5432
 
-MINIO_USER     ?= minio_local
-MINIO_PASSWORD ?= minio_local_dev
 LOCAL_BUCKET   ?= pdl-ingest-local
 DELIVERY_DATE  ?= 2026_05_22
 
 # Env for host-side Python (ingester + PDL API callers): local Postgres +
-# boto3 pointed at MinIO. PDL_API_KEY is inherited from your shell.
+# boto3 pointed at the local S3 stand-in. PDL_API_KEY is inherited from your shell.
 INGEST_ENV := \
     DATABASE_URL=postgresql://$(PG_USER):$(PG_PASSWORD)@$(PG_HOST):$(PG_PORT)/$(PG_DB) \
     AWS_ENDPOINT_URL=http://localhost:9000 \
-    AWS_ACCESS_KEY_ID=$(MINIO_USER) \
-    AWS_SECRET_ACCESS_KEY=$(MINIO_PASSWORD) \
+    AWS_ACCESS_KEY_ID=local \
+    AWS_SECRET_ACCESS_KEY=local \
     AWS_DEFAULT_REGION=us-east-1
 
 # Env for dbt's `local` target (processing/dbt/profiles.yml reads DBT_PG_*).
@@ -57,6 +55,18 @@ DBT_ENV := \
     DBT_PG_USER=$(PG_USER) \
     DBT_PG_PASSWORD=$(PG_PASSWORD) \
     DBT_PG_DBNAME=$(PG_DB)
+
+# Readiness waits. Give up after WAIT_TIMEOUT seconds and show the service's
+# last log lines instead of hanging forever (e.g. if the container exited).
+WAIT_TIMEOUT ?= 120
+WAIT_PG = n=0; until $(COMPOSE) exec -T postgres pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1; do \
+    n=$$((n+1)); if [ $$n -ge $(WAIT_TIMEOUT) ]; then \
+      echo "postgres not ready after $(WAIT_TIMEOUT)s; last log lines:"; $(COMPOSE) logs --tail 20 postgres; exit 1; fi; \
+    sleep 1; done
+WAIT_S3 = n=0; until [ "$$(docker inspect --format '{{.State.Health.Status}}' pdl_test_s3 2>/dev/null)" = "healthy" ]; do \
+    n=$$((n+1)); if [ $$n -ge $(WAIT_TIMEOUT) ]; then \
+      echo "s3 not healthy after $(WAIT_TIMEOUT)s; last log lines:"; $(COMPOSE) --profile ingester logs --tail 20 s3; exit 1; fi; \
+    sleep 1; done
 
 # Helpful echo coloring (NO_COLOR=1 to disable).
 ifndef NO_COLOR
@@ -97,14 +107,14 @@ dev-up: ## bring up core services (postgres + flyway-init + fixture-load)
 	@# Poll pg_isready inside the container: needs no host tools beyond
 	@# docker (parsing `compose ps --format json` would need jq and differs
 	@# across compose versions).
-	@until $(COMPOSE) exec -T postgres pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1; do sleep 1; done
+	@$(WAIT_PG)
 	$(COMPOSE) up flyway-init fixture-load
 	@printf "\n$(GREEN)✓ dev environment ready$(RESET)\n"
 	@printf "  postgres:    localhost:5432  (user=$(PG_USER), pw=$(PG_PASSWORD), db=$(PG_DB))\n"
 	@printf "  connect via your host pgAdmin app, or import infra/local/pgadmin/local-server.json\n"
 	@printf "\n  Next steps (conda activate pdl_test first):\n"
 	@printf "    $(CYAN)make dbt-pdl$(RESET)                # build PDL dbt models\n"
-	@printf "    $(CYAN)make dev-up-ingester$(RESET)        # + MinIO for s3_ingester e2e\n"
+	@printf "    $(CYAN)make dev-up-ingester$(RESET)        # + local S3 for s3_ingester e2e\n"
 
 .PHONY: dev-up-ingester
 dev-up-ingester: ## bring up core + ingester profile (raw.pdl_person stays empty; ingester populates it)
@@ -112,24 +122,20 @@ dev-up-ingester: ## bring up core + ingester profile (raw.pdl_person stays empty
 	@# can populate it via the real Finder → Loader → Projection chain.
 	SKIP_RAW_LOAD=1 $(COMPOSE) up -d postgres
 	@printf "$(YELLOW)waiting for postgres ready...$(RESET)\n"
-	@until $(COMPOSE) exec -T postgres pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1; do sleep 1; done
+	@$(WAIT_PG)
 	SKIP_RAW_LOAD=1 $(COMPOSE) up flyway-init fixture-load
-	$(COMPOSE) --profile ingester up -d minio
-	@printf "$(YELLOW)waiting for minio ready...$(RESET)\n"
-	@# Read Docker's own healthcheck state via `docker inspect`. The minio
-	@# image carries an internal HEALTHCHECK directive that Compose uses
-	@# (visible as `(healthy)` in `compose ps`); inspecting it sidesteps
-	@# needing any host tool (no jq) OR any in-container tool (the minio
-	@# image ships neither wget nor curl). Returns "healthy" once ready.
-	@until [ "$$(docker inspect --format '{{.State.Health.Status}}' pdl_test_minio 2>/dev/null)" = "healthy" ]; do sleep 1; done
+	$(COMPOSE) --profile ingester up -d s3
+	@printf "$(YELLOW)waiting for local S3 ready...$(RESET)\n"
+	@# Read the compose healthcheck state via `docker inspect`, so no host
+	@# tool (e.g. jq) is needed. Returns "healthy" once ready.
+	@$(WAIT_S3)
 	@# --no-deps stops compose from re-running fixture-load through
-	@# minio-init's `depends_on`; that re-run would not see SKIP_RAW_LOAD and
+	@# s3-init's `depends_on`; that re-run would not see SKIP_RAW_LOAD and
 	@# would load raw.pdl_person directly. SKIP_RAW_LOAD=1 is repeated here as
 	@# a second guard.
-	SKIP_RAW_LOAD=1 DELIVERY_DATE=$(DELIVERY_DATE) $(COMPOSE) --profile ingester up --no-deps minio-init
+	SKIP_RAW_LOAD=1 DELIVERY_DATE=$(DELIVERY_DATE) $(COMPOSE) --profile ingester up --no-deps s3-init
 	@printf "\n$(GREEN)✓ ingester profile ready$(RESET)\n"
-	@printf "  minio S3 API: localhost:9000  (boto3 endpoint)\n"
-	@printf "  minio console: http://localhost:9001  (user=$(MINIO_USER), pw=$(MINIO_PASSWORD))\n"
+	@printf "  S3 API:       http://localhost:9000  (boto3 endpoint; any credentials)\n"
 	@printf "  bucket:       $(LOCAL_BUCKET)\n"
 	@printf "  fixture path: $(DELIVERY_DATE)/data/part-00000.csv.gz + $(DELIVERY_DATE)/COMPLETED\n"
 	@printf "\n  Try:  $(CYAN)make ingest-pdl$(RESET)     # PDL Finder → Loader → Projection only\n"
@@ -158,15 +164,15 @@ dev-logs: ## tail logs from all running services
 # ──────────────────────────────────────────────────────────────────
 #
 # Target shape:
-#   - Python ingester only:  `ingest-pdl`           (raw.* populated from MinIO)
+#   - Python ingester only:  `ingest-pdl`           (raw.* populated from local S3)
 #   - dbt only:              `dbt-<tag>`            (build staging + downstream)
 #   - Full chain:            `pipeline-pdl`         (= ingest-pdl + dbt-pdl)
 
 .PHONY: ingest-pdl
-ingest-pdl: ## run the PDL ingester (Finder → Loader → Projection) against MinIO
+ingest-pdl: ## run the PDL ingester (Finder → Loader → Projection) against the local S3 stand-in
 	@# --source pdl_full_local picks up configs/pdl_full_local.yaml, which
 	@# differs from pdl_full.yaml only in bucket=pdl-ingest-local.
-	@# AWS_ENDPOINT_URL=http://localhost:9000 routes boto3 at MinIO instead
+	@# AWS_ENDPOINT_URL=http://localhost:9000 routes boto3 at the local S3 instead
 	@# of real S3.
 	$(INGEST_ENV) python -m processing.s3_ingester.run \
 	    --source pdl_full_local \
@@ -179,13 +185,17 @@ ingest-pdl: ## run the PDL ingester (Finder → Loader → Projection) against M
 # `tag:<x>+` selects the tagged staging model AND all downstream descendants.
 # Tags are defined in processing/dbt/dbt_project.yml.
 #
-# Requires processing/dbt/profiles.yml (copy from profiles.yml.example once).
+# On first use, creates processing/dbt/profiles.yml from profiles.yml.example
+# (gitignored so local edits stay local) and runs `dbt deps` if dbt_packages/
+# is missing (also gitignored).
 #
 # Why this isn't `dbt-pdl: ## …` (empty) + a pattern rule alone: GNU Make
 # treats a PHONY target with no recipe as satisfied without consulting the
 # pattern rule, so empty stubs would silently no-op. Each named alias gets
 # an explicit recipe via $(call DBT_BUILD,<tag>) to force the recipe to run.
-DBT_BUILD = cd processing/dbt && $(DBT_ENV) dbt build \
+DBT_BUILD = cd processing/dbt && { [ -f profiles.yml ] || cp profiles.yml.example profiles.yml; } \
+                && { [ -d dbt_packages ] || $(DBT_ENV) dbt deps --profiles-dir . --project-dir .; } \
+                && $(DBT_ENV) dbt build \
                 --profiles-dir . --project-dir . --select tag:$(1)+
 
 .PHONY: dbt-pdl dbt-integration

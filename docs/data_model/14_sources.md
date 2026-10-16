@@ -4,7 +4,7 @@
 
 **Sources**: People Data Labs only, through two channels:
 
-1. **PDL Person bulk delivery** — monthly person snapshots + delta files, read from S3 (or local MinIO).
+1. **PDL Person bulk delivery** — monthly person snapshots + delta files, read from S3 (or the local S3 stand-in, moto server).
 2. **PDL API** — Company Enrichment plus the Company / Location / School Cleaner endpoints, called by `processing/pdl_api`.
 
 ---
@@ -25,7 +25,7 @@
 **Path**:
 
 ```
-S3 / MinIO  ──Finder──▶  Loader (boto3 download → decompress → psycopg2 COPY FROM STDIN)
+S3          ──Finder──▶  Loader (boto3 download → decompress → psycopg2 COPY FROM STDIN)
             ──▶ raw.pdl_person            (full snapshot; partitioned by part file; latest-only)
             ──▶ raw.pdl_merged_records    ─┐
                 raw.pdl_deleted_records    ├─ PDL projection ─▶ catalog.pdl_id_aliases

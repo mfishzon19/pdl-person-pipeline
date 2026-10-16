@@ -7,7 +7,7 @@
 #
 # Profiles:
 #   (default)   postgres + flyway-init + fixture-load
-#   ingester    + minio + minio-init (S3-compatible bucket for s3_ingester e2e work)
+#   ingester    + s3 + s3-init (local S3 stand-in, moto server, for s3_ingester e2e work)
 #
 # See docs/design/local-dev-design.md for the full architecture + rationale.
 #
@@ -96,7 +96,7 @@ services:
       # committed sample → skip.
       FIXTURE_URL: ${FIXTURE_URL:-}
       # If 1, skip the direct \copy into raw.pdl_person — just cache the
-      # fixture for minio-init to upload. Set by `make dev-up-ingester`
+      # fixture for s3-init to upload. Set by `make dev-up-ingester`
       # so the ingester can populate raw via its own Finder→Loader path.
       SKIP_RAW_LOAD: ${SKIP_RAW_LOAD:-0}
     entrypoint: /bin/bash
@@ -111,43 +111,36 @@ services:
   # Ingester profile — S3-compat object store for s3_ingester e2e work
   # ──────────────────────────────────────────────────────────────────
 
-  minio:
-    image: minio/minio:latest
+  # S3 API stand-in: moto's server mode (the same library the unit tests use
+  # to fake S3). In-memory: state resets when the container restarts, and
+  # `make dev-up-ingester` re-seeds it via s3-init.
+  s3:
+    image: motoserver/moto:5.1.16
     profiles: ["ingester"]
-    container_name: pdl_test_minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minio_local
-      MINIO_ROOT_PASSWORD: minio_local_dev
+    container_name: pdl_test_s3
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # Web console (http://localhost:9001)
-    volumes:
-      - minio_data:/data
+      - "9000:5000" # S3 API at http://localhost:9000
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/moto-api/"]
       interval: 5s
       timeout: 5s
       retries: 12
 
   # One-shot. Creates the local PDL bucket + uploads the cached fixture
-  # delivery (same file fixture-load cached) as a COMPLETED-suffixed
-  # S3 layout that processing.s3_ingester.run can consume directly.
-  minio-init:
-    image: minio/mc:latest
+  # (same file fixture-load cached) as a PDL-shaped delivery with its
+  # COMPLETED sentinel, so processing.s3_ingester.run can consume it.
+  s3-init:
+    image: motoserver/moto:5.1.16 # reuses the image for its Python + boto3
     profiles: ["ingester"]
-    container_name: pdl_test_minio_init
+    container_name: pdl_test_s3_init
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
       fixture-load:
         condition: service_completed_successfully
-    entrypoint: /bin/sh
-    command: ["/scripts/minio-init.sh"]
+    entrypoint: ["python", "/scripts/s3-init.py"]
     environment:
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_ROOT_USER: minio_local
-      MINIO_ROOT_PASSWORD: minio_local_dev
+      S3_ENDPOINT: http://s3:5000
       LOCAL_BUCKET: pdl-ingest-local
       # Single source of truth is the Makefile's DELIVERY_DATE.
       DELIVERY_DATE: ${DELIVERY_DATE:-}
@@ -158,4 +151,3 @@ services:
 
 volumes:
   postgres_data:
-  minio_data:

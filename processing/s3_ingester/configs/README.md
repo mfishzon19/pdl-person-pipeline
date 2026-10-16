@@ -59,4 +59,4 @@ Finder does not write to S3. The Loader gunzips `.gz` objects itself, so no Cont
 ## Files
 
 - [`pdl_full.yaml`](pdl_full.yaml) — PDL monthly snapshot + delta-folder loads (real delivery bucket; placeholder name).
-- [`pdl_full_local.yaml`](pdl_full_local.yaml) — identical, but pointed at the local MinIO bucket `pdl-ingest-local`.
+- [`pdl_full_local.yaml`](pdl_full_local.yaml) — identical, but pointed at the local S3 bucket `pdl-ingest-local`.

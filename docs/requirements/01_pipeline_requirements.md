@@ -28,7 +28,7 @@ Update this document when a requirement changes. Open items are listed in [desig
 
 ### In scope
 
-- Ingestion of PDL Person bulk deliveries from S3 (or a local MinIO bucket) into `raw.*`.
+- Ingestion of PDL Person bulk deliveries from S3 (or a bucket on the local S3 stand-in, moto server) into `raw.*`.
 - Projection of PDL delta folders (merged / deleted / opted-out) into the identity ledger.
 - Parsing PDL Person JSON into typed `staging.pdl_person_*_parsed` tables and deduplicated, alias-resolved `staging.pdl_person_*_unique` tables.
 - PDL API calls: Company Enrichment and the Company / Location / School Cleaners, with queue, audit, and cost controls in the `pdl_api` schema, parsed into `staging.pdl_api_company_parsed`.
@@ -39,7 +39,7 @@ Update this document when a requirement changes. Open items are listed in [desig
 ### Globally out of scope
 
 - **Real-time ingestion.** Everything is batch.
-- **Push-based delivery.** Deliveries are pulled from S3 / MinIO.
+- **Push-based delivery.** Deliveries are pulled from S3.
 - **Upstream data remediation.** If PDL ships bad data we flag it, filter it, or cleanse it on our side; we do not correct PDL.
 - **Attribute history / SCD Type 2.** Integration overwrites on update. No "Jane's title was X in March, Y in April" is kept anywhere.
 - **Automatic merge reversal (splits).** Merges are one-way; corrections are manual.
@@ -101,7 +101,7 @@ This architecture shapes the rest of this document:
 
 **Format**: gzipped CSV part files; each line is a single JSON object holding a full person record with nested experience, education, and company/school details. Nested elements can contain arrays.
 
-**Bucket layout** (S3 for real deliveries; MinIO bucket `pdl-ingest-local` for local runs):
+**Bucket layout** (S3 for real deliveries; local S3 bucket `pdl-ingest-local` for local runs):
 
 ```
 s3://<pdl-bucket>/
@@ -142,7 +142,7 @@ Notes:
 
 **Redacted fields**: on the subscription tier this pipeline was built against, several top-level person fields (street address, mobile phone, personal email, birth date, non-LinkedIn social URLs) arrive as `"true"` / `"false"` placeholders, never real values. Columns whose PDL source is a placeholder **must not exist** in staging or integration.
 
-**Load path**: the Ingester downloads each object with boto3 (standard AWS credential chain / `AWS_PROFILE` for real S3; `AWS_ENDPOINT_URL` for MinIO), decompresses it, and streams it into the raw leaf partition with `COPY ... FROM STDIN` over psycopg2. Each file is TRUNCATE + COPY into its own leaf, so re-running a delivery is safe.
+**Load path**: the Ingester downloads each object with boto3 (standard AWS credential chain / `AWS_PROFILE` for real S3; `AWS_ENDPOINT_URL` for local S3), decompresses it, and streams it into the raw leaf partition with `COPY ... FROM STDIN` over psycopg2. Each file is TRUNCATE + COPY into its own leaf, so re-running a delivery is safe.
 
 ### 3.2 PDL API
 
@@ -201,7 +201,7 @@ Requirements:
 ### Pipeline flow through the ledger
 
 ```
-PDL delivery (S3 / MinIO)
+PDL delivery (S3 / local S3)
         |
         v
   Raw ingestion (Finder -> Loader)
@@ -329,7 +329,7 @@ Requirements:
 ### Running locally
 
 - `make dev-up` starts Postgres, applies Flyway migrations, and loads a sanitized PDL fixture.
-- `make dev-up-ingester` adds MinIO (bucket `pdl-ingest-local`); `make ingest-pdl` runs Finder → Loader → ledger projection.
+- `make dev-up-ingester` adds local S3 (moto server, bucket `pdl-ingest-local`, in-memory); `make ingest-pdl` runs Finder → Loader → ledger projection.
 - `make dbt-pdl` builds staging and downstream; `make pipeline-pdl` runs ingest + dbt.
 - Configuration comes from environment variables / a local `.env` (`DATABASE_URL`, `PDL_API_KEY`, `AWS_PROFILE` / `AWS_ENDPOINT_URL`). No secrets in files.
 
@@ -349,7 +349,7 @@ Only one delivery is processed at a time. Running two loads concurrently against
 
 - dbt tests (uniqueness, not-null, relationships, accepted values, singular tests) run as part of every build.
 - Load history is recorded in the `catalog.*` audit tables (`ingestion_run`, `ingestion_file`, `pdl_delivery`); dbt run results live in dbt's own `target/` artifacts.
-- Python components log to stdout; container (Postgres / Flyway / MinIO) logs are available via `make dev-logs`.
+- Python components log to stdout; container (Postgres / Flyway / local S3) logs are available via `make dev-logs`.
 - Tests follow the tiered plan in [`../design/07_test_plan.md`](../design/07_test_plan.md). Tests must run without AWS credentials, network access, or real PDL calls.
 
 ---
