@@ -1,0 +1,21 @@
+# person-attrs — person + everything attached to a person
+# Aggressive simplification: integration tables only. ref.* lookup tables dropped;
+# FK refs to ref.* stripped from kept tables (default strict mode does this automatically).
+# Purpose: review cardinality and presence of multi-valued person attributes without
+# geo/taxonomy noise. For the actual ref hierarchies, see scopes/places.txt
+# and the individual ref table docs.
+
+# Person — central entity. No companion address table — V20 inlined scalar lat/long/
+# postal_code on integration.person (Option C); V21 renamed
+# integration.address → integration.company_hq_address; V24 dropped
+# that too once company was verified to be 1:1 with its address
+# (company now also carries inline address scalars).
+integration.person
+
+# Person junctions — PDL-fed
+integration.person_country
+integration.person_state_province
+integration.person_location
+integration.person_skill
+integration.person_interest
+integration.person_language

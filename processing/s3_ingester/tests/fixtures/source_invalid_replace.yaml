@@ -1,0 +1,6 @@
+# Test fixture. replace_strategy outside the whitelist. Should be rejected.
+column_list: payload
+copy_options: "FORMAT csv"
+bucket: test-bucket
+region: us-east-1
+replace_strategy: bogus

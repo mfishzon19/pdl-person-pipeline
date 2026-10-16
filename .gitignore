@@ -1,0 +1,42 @@
+.DS_Store
+.vscode/
+
+# Python bytecode / caches
+*$py.class
+__pycache__/
+*.py[cod]
+
+# Local env files — never commit secrets.
+# .env.example is the committed template (not matched by these patterns).
+.env
+.env.local
+
+# Claude Code: keep personal/host-specific permissions out of the repo.
+.claude/settings.local.json
+
+
+# dbt build output + local profile (copy from profiles.yml.example)
+target/
+dbt_packages/
+logs/
+.user.yml
+processing/dbt/profiles.yml
+
+# Python tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# IDEs
+.idea/
+
+# Generated ERD artifacts (regenerated from DBML)
+modeling/erd/
+
+# Real company-hierarchy input for the cleansing R&D, supplied locally.
+# The committed sample is company_hierarchy.example.csv.
+docs/pdl_data_cleansing/data/company_hierarchy.csv

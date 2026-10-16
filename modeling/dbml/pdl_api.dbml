@@ -1,0 +1,213 @@
+// =============================================================================
+// pdl_api.dbml — operational state for the generic PDL API caller.
+//
+// Per-feature input lists, audit, and driver views supporting PDL Cleaner
+// and Enrichment endpoints. NOT a content schema — these tables are caller
+// plumbing (queue + state + audit), not canonical data. Canonical
+// destination tables (e.g. integration.company) live in their own schemas.
+//
+// Source of truth for the pdl_api schema's tables and indexes. Authored
+// by hand; do NOT edit generated downstream artifacts (Flyway migrations).
+//
+// What's modeled here: tables, columns, indexes, comments.
+// What's NOT modeled (lives only in the migration files):
+//   - Sequence pdl_api.company_enrichment_batch_seq
+//   - CHECK constraints on cleaner_status / enrichment_status
+//   - GENERATED columns (pdl_company_id, pdl_dataset_version, pdl_likelihood,
+//     cleaned_location [location, from ->>'name'], pdl_school_id)
+//   - Views v_company_input_for_cleaner / v_company_input_for_enrichment /
+//     v_location_input / v_school_input
+//
+// One DBML file per schema (this file = the whole pdl_api schema). Each new
+// PDL feature adds its tables to this file AND ships a new V_n migration,
+// `V<n>__pdl_api_<feature>.sql`. The DBML always reflects current state;
+// the migrations are how-we-got-there.
+//
+// Spec reference: docs/design/18_pdl_api_generic_caller.md, sections "Queue
+// tables", "Driver views" and "Audit tables".
+// Migrations:
+//   - modeling/flyway/migrations/V3__pdl_api_company_enrichment.sql (baseline: company cleaner + enrichment)
+//   - modeling/flyway/migrations/V35__pdl_api_location_cleaner.sql
+//   - modeling/flyway/migrations/V36__pdl_api_school_cleaner.sql
+//   - Future per-feature additions: V<n>__pdl_api_<feature>.sql
+// =============================================================================
+
+Project pdl_etl_pdl_api {
+  database_type: 'PostgreSQL'
+  Note: 'PDL ETL — pdl_api schema. Operational state for the generic PDL API caller (input lists, audit, driver views).'
+}
+
+// -----------------------------------------------------------------------------
+// company_input_list — queue + state for company-cleaner and
+// company-enrichment workers.
+//
+// Same pdl_company_id can appear in multiple rows (same company on two
+// different input lists) — only the first to finish enrichment hits PDL; the
+// enrichment loader marks siblings 'skipped_already_enriched'.
+// -----------------------------------------------------------------------------
+
+Table pdl_api.company_input_list {
+  id                 bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  source_list        text        [not null, note: "Provenance label, e.g. 'example_company_list', 'pdl_most_frequent_companies', 'person_derived'."]
+  pdl_search_params  jsonb       [not null, note: 'PDL API request body for matching: {"name": ..., "website": ...} when unresolved, or {"id": "<pdl_company_id>"} when pre-resolved. No URL, host, or auth — caller supplies those.']
+  passthrough_params jsonb       [note: "Caller correlation data — echoed via PDL's per-record metadata field. Free-form jsonb."]
+  pdl_company_id     text        [note: 'Loose reference to integration.company.pdl_company_id (text). NULL until Cleaner resolves it, or pre-populated when the input list already carries a known PDL company id (cleaner_status = not_needed). No FK — destination row may not exist yet when this is set.']
+  cleaner_status     text        [not null, note: "CHECK in migration: 'pending' | 'not_needed' | 'in_progress' | 'resolved' | 'not_found' | 'error'."]
+  enrichment_status  text        [not null, note: "CHECK in migration: 'pending' | 'in_progress' | 'enriched' | 'not_found' | 'error' | 'skipped_already_enriched'."]
+  worker_id          text        [note: 'NULL unless currently claimed by a worker. Sweeper resets stale in_progress rows back to pending.']
+  claimed_at         timestamptz
+  created_at         timestamptz [not null, default: `clock_timestamp()`]
+
+  Indexes {
+    cleaner_status     [name: 'company_input_list_cleaner_pending_idx', note: "Partial: WHERE cleaner_status = 'pending'. Hand-authored in migration; DBML cannot express partial indexes."]
+    enrichment_status  [name: 'company_input_list_enrichment_pending_idx', note: "Partial: WHERE enrichment_status = 'pending'. Hand-authored in migration."]
+    pdl_company_id     [name: 'company_input_list_pdl_company_id_idx']
+    source_list        [name: 'company_input_list_source_list_idx']
+  }
+
+  Note: 'Queue + state for company-cleaner and company-enrichment workers. One row per company-on-a-list; same pdl_company_id may appear in multiple rows (loader collapses siblings after first enrichment).'
+}
+
+// -----------------------------------------------------------------------------
+// company_cleaner_call — append-only audit of PDL Company Cleaner API calls.
+//
+// Single-record endpoint (not bulk), so one row per HTTP call. Free API but
+// logged for replay + debugging. pdl_company_id is a STORED GENERATED column
+// derived from response_json so it can never drift (hand-authored in the
+// migration; DBML cannot express GENERATED).
+// -----------------------------------------------------------------------------
+
+Table pdl_api.company_cleaner_call {
+  id              bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  input_list_id   bigint      [not null, ref: > pdl_api.company_input_list.id]
+  endpoint        text        [not null]
+  request_json    jsonb       [not null]
+  response_status smallint
+  response_json   jsonb
+  called_at       timestamptz [not null, default: `clock_timestamp()`]
+  latency_ms      int
+  error_message   text
+  pdl_company_id  text        [note: "STORED GENERATED in migration: (response_json->>'id'). PDL's natural-key response field; indexable + persists to disk."]
+
+  Indexes {
+    pdl_company_id [name: 'company_cleaner_call_pdl_company_id_idx']
+    input_list_id  [name: 'company_cleaner_call_input_list_id_idx']
+    called_at      [name: 'company_cleaner_call_called_at_idx']
+  }
+
+  Note: 'Append-only audit of every PDL Company Cleaner call. PDL-level "no match" is response_status=404 (not error_message).'
+}
+
+// -----------------------------------------------------------------------------
+// company_enrichment_call — append-only audit, one row per
+// record-in-bulk-batch.
+//
+// A single HTTP call with 100 records writes 100 rows here, all sharing
+// bulk_batch_id (taken from pdl_api.company_enrichment_batch_seq —
+// hand-authored sequence in the migration). This granularity matches PDL's
+// per-match billing model while preserving the HTTP-call grouping for
+// replay.
+// -----------------------------------------------------------------------------
+
+Table pdl_api.company_enrichment_call {
+  id                  bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  bulk_batch_id       bigint      [not null, note: 'Caller takes nextval(pdl_api.company_enrichment_batch_seq) before building each batch; up to 100 records in the batch share this value.']
+  input_list_id       bigint      [not null, ref: > pdl_api.company_input_list.id]
+  endpoint            text        [not null]
+  request_json        jsonb       [not null]
+  response_status     smallint
+  response_json       jsonb
+  called_at           timestamptz [not null, default: `clock_timestamp()`, note: 'HTTP call timestamp — same for all rows in the batch.']
+  latency_ms          int         [note: 'HTTP call latency — same for all rows in the batch.']
+  error_message       text
+  pdl_company_id      text        [note: "STORED GENERATED in migration: (response_json->>'id')."]
+  pdl_dataset_version text        [note: "STORED GENERATED in migration: (response_json->>'dataset_version')."]
+  pdl_likelihood      int         [note: "STORED GENERATED in migration: ((response_json->>'likelihood')::int)."]
+
+  Indexes {
+    pdl_company_id [name: 'company_enrichment_call_pdl_company_id_idx']
+    bulk_batch_id  [name: 'company_enrichment_call_bulk_batch_id_idx']
+    input_list_id  [name: 'company_enrichment_call_input_list_id_idx']
+    called_at      [name: 'company_enrichment_call_called_at_idx']
+  }
+
+  Note: 'Append-only audit, one row per record returned in a bulk-enrichment response. bulk_batch_id groups records that shared one HTTP call.'
+}
+
+// -----------------------------------------------------------------------------
+// location cleaner (/v5/location/clean). Queue keyed on raw_input; single-record
+// audit. CHECK / GENERATED / view live in the migration (V35).
+// -----------------------------------------------------------------------------
+
+Table pdl_api.location_input_list {
+  id             bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  raw_input      text        [not null, unique, note: 'Distinct raw location string; UNIQUE dedups across sources.']
+  cleaner_status text        [not null, note: "CHECK in migration: pending/in_progress/resolved/not_found/error. Default 'pending'."]
+  worker_id      text        [note: 'NULL unless currently claimed by a worker.']
+  claimed_at     timestamptz
+  created_at     timestamptz [not null, note: 'Default clock_timestamp() in the migration.']
+
+  Indexes {
+    cleaner_status [name: 'location_input_list_pending_idx', note: "Partial WHERE cleaner_status='pending' in the migration."]
+  }
+  Note: 'Queue + state for the location cleaner. One row per distinct raw location string. Populated by INSERT ... ON CONFLICT (raw_input) DO NOTHING from whatever table holds the raw values; no dbt model populates it yet.'
+}
+
+Table pdl_api.location_cleaner_call {
+  id              bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  input_list_id   bigint      [not null, ref: > pdl_api.location_input_list.id]
+  endpoint        text        [not null]
+  request_json    jsonb       [not null]
+  response_status smallint
+  response_json   jsonb
+  called_at       timestamptz [not null, note: 'Default clock_timestamp() in the migration.']
+  latency_ms      int
+  error_message   text
+  cleaned_location     text        [note: "STORED GENERATED in migration: (response_json->>'name'). /v5/location/clean returns no top-level id; locations canonicalize by composite name."]
+
+  Indexes {
+    cleaned_location   [name: 'location_cleaner_call_cleaned_location_idx']
+    input_list_id [name: 'location_cleaner_call_input_list_id_idx']
+    called_at     [name: 'location_cleaner_call_called_at_idx']
+  }
+  Note: 'Append-only audit of every PDL /v5/location/clean call. PDL-level no-match is response_status=404 (not error_message).'
+}
+
+// -----------------------------------------------------------------------------
+// school cleaner (/v5/school/clean). Queue keyed on raw_input; single-record
+// audit. CHECK / GENERATED / view live in the migration (V36).
+// -----------------------------------------------------------------------------
+
+Table pdl_api.school_input_list {
+  id             bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  raw_input      text        [not null, unique, note: 'Distinct raw school string; UNIQUE dedups across sources.']
+  cleaner_status text        [not null, note: "CHECK in migration: pending/in_progress/resolved/not_found/error. Default 'pending'."]
+  worker_id      text        [note: 'NULL unless currently claimed by a worker.']
+  claimed_at     timestamptz
+  created_at     timestamptz [not null, note: 'Default clock_timestamp() in the migration.']
+
+  Indexes {
+    cleaner_status [name: 'school_input_list_pending_idx', note: "Partial WHERE cleaner_status='pending' in the migration."]
+  }
+  Note: 'Queue + state for the school cleaner. One row per distinct raw school string. Populated by INSERT ... ON CONFLICT (raw_input) DO NOTHING from whatever table holds the raw values; no dbt model populates it yet.'
+}
+
+Table pdl_api.school_cleaner_call {
+  id              bigint      [pk, increment, note: 'GENERATED ALWAYS AS IDENTITY in the migration.']
+  input_list_id   bigint      [not null, ref: > pdl_api.school_input_list.id]
+  endpoint        text        [not null]
+  request_json    jsonb       [not null]
+  response_status smallint
+  response_json   jsonb
+  called_at       timestamptz [not null, note: 'Default clock_timestamp() in the migration.']
+  latency_ms      int
+  error_message   text
+  pdl_school_id      text        [note: "STORED GENERATED in migration: (response_json->>'id')."]
+
+  Indexes {
+    pdl_school_id    [name: 'school_cleaner_call_pdl_school_id_idx']
+    input_list_id [name: 'school_cleaner_call_input_list_id_idx']
+    called_at     [name: 'school_cleaner_call_called_at_idx']
+  }
+  Note: 'Append-only audit of every PDL /v5/school/clean call. PDL-level no-match is response_status=404 (not error_message).'
+}

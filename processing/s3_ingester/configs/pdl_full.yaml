@@ -1,0 +1,88 @@
+# pdl_full — PDL monthly full snapshot + delta files.
+#
+# Consumed by both Finder and Loader:
+#   Finder reads: bucket, region, sentinel, file_groups
+#   Loader reads: bucket, region, column_list, copy_options,
+#                 partition_column, partition_value_type
+#
+# Per-file values (s3_key, target_table, partition_value) come from the
+# catalog.ingestion_file rows that Finder writes — NOT from this YAML.
+
+# -----------------------------------------------------------------------------
+# Loader-facing keys (passed to ingest_file() per pending file)
+# -----------------------------------------------------------------------------
+
+column_list: payload
+# Outer parentheses are required by the modern Postgres COPY syntax
+# (`WITH (FORMAT csv, ...)`). file_ingester substitutes this string
+# verbatim into `COPY ... FROM STDIN WITH <copy_options>`, so the parens
+# must be in the YAML.
+copy_options: "(FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02')"
+
+# S3 bucket PDL delivers into. PLACEHOLDER — set it to your delivery bucket.
+# For local runs use pdl_full_local.yaml (MinIO bucket pdl-ingest-local),
+# which is what `make ingest-pdl` runs.
+bucket: pdl-ingest-prod
+region: us-east-1
+
+# Partitioned mode — same partition column on raw.pdl_person and the three
+# raw.pdl_*_records delta tables (all partitioned by partition_id smallint).
+partition_column: partition_id
+partition_value_type: smallint
+
+# Each PDL delivery is a complete snapshot. TRUNCATE the parent target tables
+# at delivery start so partition_values absent from this delivery don't leave
+# stale rows from a previous delivery's leaves. (Default would be
+# 'per_partition', which is correct for independently-delivered partitions
+# but wrong for full-snapshot semantics.) See configs/README.md.
+replace_strategy: full
+
+# -----------------------------------------------------------------------------
+# Finder-facing keys
+# -----------------------------------------------------------------------------
+
+# {delivery_date} placeholder is substituted with the --delivery-date CLI value
+# (literal yyyy_mm_dd, e.g. '2026_05_22'). Sentinel must exist or Finder fails.
+
+sentinel:
+  key_pattern: "{delivery_date}/COMPLETED"
+
+# Each file_group maps an S3 location to a target raw table. Finder lists the
+# `s3_list_prefix`, regex-matches `key_pattern` (full key), and extracts
+# `partition_value` from the named regex group.
+#
+# Required groups must produce ≥1 file or Finder fails. Optional groups may be
+# absent (e.g. delta_data/ on a first delivery, or a delta type with no rows).
+
+# A file_group is a logical group of S3 files sharing the same target table
+# and load semantics. PDL has four — one for the full snapshot in data/, and
+# three for the consumed delta types in delta_data/*. See configs/README.md.
+
+file_groups:
+  - name: pdl_data
+    s3_list_prefix: "{delivery_date}/data/"
+    key_pattern: "^{delivery_date}/data/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_person
+    partition_value_from: partition_id
+    optional: false
+
+  - name: pdl_merged
+    s3_list_prefix: "{delivery_date}/delta_data/"
+    key_pattern: "^{delivery_date}/delta_data/MERGED_RECORDS_MONTHLY_V_[^/]+/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_merged_records
+    partition_value_from: partition_id
+    optional: true
+
+  - name: pdl_deleted
+    s3_list_prefix: "{delivery_date}/delta_data/"
+    key_pattern: "^{delivery_date}/delta_data/DELETED_RECORDS_MONTHLY_V_[^/]+/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_deleted_records
+    partition_value_from: partition_id
+    optional: true
+
+  - name: pdl_opted_out
+    s3_list_prefix: "{delivery_date}/delta_data/"
+    key_pattern: "^{delivery_date}/delta_data/OPTED_OUT_RECORDS_MONTHLY_V_[^/]+/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_opted_out_records
+    partition_value_from: partition_id
+    optional: true

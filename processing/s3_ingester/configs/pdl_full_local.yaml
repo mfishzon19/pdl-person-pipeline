@@ -1,0 +1,64 @@
+# pdl_full_local — local-dev twin of pdl_full.yaml.
+#
+# Identical contract; the ONLY difference is `bucket:` points at the MinIO
+# bucket the local docker-compose stack creates (`pdl-ingest-local`)
+# instead of the real delivery bucket. This file is consumed by
+# `make ingest-pdl` / `make pipeline-pdl`, which run the ingester on the
+# host with AWS_ENDPOINT_URL=http://localhost:9000 so boto3 resolves to
+# local MinIO instead of real S3.
+#
+# Keep all NON-bucket keys (column_list, copy_options, partition_*,
+# replace_strategy, sentinel, file_groups) byte-identical to pdl_full.yaml.
+# When pdl_full.yaml changes, mirror the change here too. Long term we may
+# inject the bucket via env var so we can collapse back to one config file.
+
+column_list: payload
+copy_options: "(FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02')"
+
+# ↓↓↓ THE ONLY LINE THAT DIFFERS FROM pdl_full.yaml ↓↓↓
+bucket: pdl-ingest-local
+# ↑↑↑                                              ↑↑↑
+
+region: us-east-1
+
+partition_column: partition_id
+partition_value_type: smallint
+replace_strategy: full
+
+sentinel:
+  key_pattern: "{delivery_date}/COMPLETED"
+
+# Only `pdl_data` is required. Local MinIO is seeded with a single part-00000
+# under data/ — no delta files. Keeping the optional delta groups defined so
+# this YAML stays a true mirror of pdl_full.yaml (just swap the bucket).
+#
+# Extension convention: ALL PDL data + delta files use `.csv.gz` (matches
+# what PDL delivers).
+file_groups:
+  - name: pdl_data
+    s3_list_prefix: "{delivery_date}/data/"
+    key_pattern: "^{delivery_date}/data/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_person
+    partition_value_from: partition_id
+    optional: false
+
+  - name: pdl_merged
+    s3_list_prefix: "{delivery_date}/delta_data/"
+    key_pattern: "^{delivery_date}/delta_data/MERGED_RECORDS_MONTHLY_V_[^/]+/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_merged_records
+    partition_value_from: partition_id
+    optional: true
+
+  - name: pdl_deleted
+    s3_list_prefix: "{delivery_date}/delta_data/"
+    key_pattern: "^{delivery_date}/delta_data/DELETED_RECORDS_MONTHLY_V_[^/]+/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_deleted_records
+    partition_value_from: partition_id
+    optional: true
+
+  - name: pdl_opted_out
+    s3_list_prefix: "{delivery_date}/delta_data/"
+    key_pattern: "^{delivery_date}/delta_data/OPTED_OUT_RECORDS_MONTHLY_V_[^/]+/part-(?P<partition_id>\\d{5})\\.csv\\.gz$"
+    target_table: raw.pdl_opted_out_records
+    partition_value_from: partition_id
+    optional: true

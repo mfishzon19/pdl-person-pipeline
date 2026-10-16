@@ -1,0 +1,47 @@
+-- =============================================================================
+-- V13 — Drop GENERATED expression on
+--       staging.pdl_person_education_unique.degrees_text
+--
+-- WHY:
+-- V12 created `degrees_text` as `text GENERATED ALWAYS AS (degrees::text)
+-- STORED` so Postgres would auto-populate the dedup discriminator on every
+-- INSERT. In practice this conflicts with dbt-postgres's default
+-- incremental+append INSERT generator, which builds the INSERT using the
+-- target table's full column list — including degrees_text, which the dbt
+-- model SELECT cannot produce (Postgres rejects user-supplied values on
+-- GENERATED ALWAYS columns). The model would error before any row was
+-- inserted.
+--
+-- The chosen alternative was a project-wide macro override that switches
+-- dbt's INSERT to use temp_relation columns instead of target columns.
+-- That works but changes INSERT mechanics for every incremental+append
+-- model in the project — a project-wide design change that warrants its
+-- own ADR / separate change, not a side effect of a feature change.
+--
+-- This migration instead resolves the issue locally: drop the generated
+-- expression on degrees_text. The column stays as plain `text`. The dbt
+-- model for staging.pdl_person_education_unique computes
+-- `degrees::text AS degrees_text` in its SELECT — explicit, single
+-- responsibility, no project-wide INSERT-macro change required.
+--
+-- WHAT THIS DOES:
+-- `ALTER COLUMN ... DROP EXPRESSION` removes the GENERATED clause but
+-- keeps the column as plain text. Existing rows retain their
+-- previously-computed values (no data loss / no rewrite of existing
+-- values). Future INSERTs must supply a value explicitly — the dbt model
+-- now provides one.
+--
+-- BLAST RADIUS:
+--   - UNIQUE constraint uq_pdl_person_education_unique_nk on
+--     (person_pdl_id, school_pdl_id, start_year, degrees_text) is
+--     unaffected — it references the column by name, not by the
+--     generated expression. Existing index entries stay valid.
+--   - No table rewrite (Postgres `DROP EXPRESSION` is metadata-only on
+--     stored generated columns; data remains in place).
+--   - integration.* models never read degrees_text — they consume the
+--     `degrees` jsonb directly. This column exists only for the dedup
+--     discriminator role.
+-- =============================================================================
+
+ALTER TABLE staging.pdl_person_education_unique
+  ALTER COLUMN degrees_text DROP EXPRESSION;

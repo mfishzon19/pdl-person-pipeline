@@ -1,0 +1,8 @@
+# dbt package dependencies.
+#
+# dbt-utils is required by the natural-key uniqueness tests in
+# processing/dbt/models/staging/pdl_person/schema.yml (_unique models).
+
+packages:
+  - package: dbt-labs/dbt_utils
+    version: 1.3.0

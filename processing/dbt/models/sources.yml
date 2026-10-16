@@ -1,0 +1,128 @@
+version: 2
+
+# Sources are Flyway-owned tables; dbt only reads from them via {{ source() }}.
+# Adding a table here makes it referenceable from any model. Per docs/design/02 §11:
+# DDL ownership is Flyway's; dbt only does data flow.
+
+sources:
+  - name: raw
+    description: |
+      Untouched source bytes ingested from S3. Partitioned tables, one parent
+      per source; leaves created lazily by the Python ingester (COPY FROM
+      STDIN). DDL in modeling/flyway/migrations/V2__raw_baseline.sql +
+      modeling/dbml/raw.dbml.
+    schema: raw
+    tables:
+      - name: pdl_person
+        description: |
+          PDL person snapshot landings. One row per (partition_id, payload),
+          where payload is the full PDL person JSON record. Partition by
+          partition_id smallint. Loaded by the Python ingester from PDL data/
+          deliveries.
+        columns:
+          - name: partition_id
+            description: PDL file index within the delivery (0..N).
+          - name: payload
+            description: Full PDL person JSON record as emitted by PDL.
+          - name: loaded_at
+            description: When the ingester loaded this row (wall clock).
+
+  - name: catalog
+    description: |
+      Identity ledger + observability tables (Flyway-owned, stateful across
+      runs). staging.pdl_person_unique reads pdl_id_aliases for alias
+      resolution. pdl_inactive is declared for ad-hoc queries; no model
+      filters on it, because inactive persons are already absent from a
+      delivery's data/ files (docs/design/15_pdl_staging_design.md).
+    schema: catalog
+    tables:
+      - name: pdl_id_aliases
+        description: |
+          PDL-internal merge mappings: old_pdl_id -> current_pdl_id.
+          Append-only; populated by raw.project_pdl_deltas() from PDL
+          MERGED_RECORDS folder.
+      - name: pdl_inactive
+        description: |
+          Append-only audit log of PDL deactivation / opt-out / reactivation
+          events. The latest event per pdl_id (by observed_at) determines
+          current state.
+
+  - name: pdl_api
+    description: |
+      Operational state + append-only audit for the generic PDL API caller
+      (input lists, per-call audit, driver views). Flyway-owned; dbt only
+      reads via the source() function. DDL in modeling/flyway/migrations/
+      V3__pdl_api_company_enrichment.sql + modeling/dbml/pdl_api.dbml.
+    schema: pdl_api
+    tables:
+      - name: company_enrichment_call
+        description: |
+          Append-only audit of PDL Company Enrichment calls — one row per
+          record returned in a bulk response. staging.pdl_api_company_parsed
+          flattens the 200-status rows. See docs/design/18_pdl_api_generic_caller.md.
+        columns:
+          - name: id
+            description: Surrogate call-record id (GENERATED IDENTITY).
+          - name: bulk_batch_id
+            description: Groups records that shared one HTTP call.
+          - name: response_status
+            description: HTTP status; staging filters to 200.
+          - name: response_json
+            description: Full PDL Company Enrichment response record as jsonb.
+          - name: pdl_company_id
+            description: STORED GENERATED (response_json->>'id').
+          - name: called_at
+            description: HTTP call timestamp.
+      - name: location_input_list
+        description: |
+          Location cleaner queue (V35). raw_input = composed "City, State,
+          Country", composed via macros/compose_location_input.sql. Filled
+          with INSERT ... ON CONFLICT (raw_input) DO NOTHING (no dbt model
+          populates or reads it yet); drained out-of-band by the PDL location
+          cleaner (processing/pdl_api).
+        columns:
+          - name: id
+            description: Surrogate id (GENERATED ALWAYS AS IDENTITY).
+          - name: raw_input
+            description: Composed address string; UNIQUE.
+          - name: cleaner_status
+            description: pending / in_progress / resolved / not_found / error.
+      - name: school_input_list
+        description: |
+          School cleaner queue (V36). raw_input = LOWER(TRIM(school_name)).
+          Filled with INSERT ... ON CONFLICT (raw_input) DO NOTHING (no dbt
+          model populates or reads it yet); drained out-of-band by the PDL
+          school cleaner (processing/pdl_api).
+        columns:
+          - name: id
+            description: Surrogate id (GENERATED ALWAYS AS IDENTITY).
+          - name: raw_input
+            description: School-name string; UNIQUE.
+          - name: cleaner_status
+            description: pending / in_progress / resolved / not_found / error.
+      - name: location_cleaner_call
+        description: |
+          Append-only audit of PDL /v5/location/clean calls (V35). Written by
+          the out-of-dbt PDL location-cleaner drainer.
+        columns:
+          - name: input_list_id
+            description: FK to pdl_api.location_input_list.id.
+          - name: response_status
+            description: HTTP status (200 = resolved).
+          - name: cleaned_location
+            description: STORED GENERATED (response_json->>'name'). /v5/location/clean returns no id; canonical value is the composite name.
+          - name: called_at
+            description: HTTP call timestamp; the latest call per input row is the current result.
+      - name: school_cleaner_call
+        description: |
+          Append-only audit of PDL /v5/school/clean calls (V36). Written by
+          the out-of-dbt PDL school-cleaner drainer, not dbt.
+        columns:
+          - name: input_list_id
+            description: FK to pdl_api.school_input_list.id.
+          - name: response_status
+            description: HTTP status (200 = resolved).
+          - name: pdl_school_id
+            description: STORED GENERATED (response_json->>'id').
+          - name: called_at
+            description: HTTP call timestamp; the latest call per input row is the current result.

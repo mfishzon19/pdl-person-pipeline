@@ -1,0 +1,5 @@
+# Test fixture. Flat-table source config (no partition keys).
+column_list: payload
+copy_options: "FORMAT csv"
+bucket: test-bucket
+region: us-east-1

@@ -1,0 +1,4 @@
+# Fixture cache — populated at runtime by fixture-load.sh.
+# Don't commit binary fixtures.
+*
+!.gitignore

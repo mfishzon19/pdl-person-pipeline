@@ -1,0 +1,33 @@
+# industry — industry attachment surface
+# The three tables that carry an industry FK, plus the two ref tables they point at.
+# Purpose: show every place a PDL row lands an industry — used to design filters
+# like "restrict to professionals in industry X" (person.industry_id = X
+# OR experience_industry.industry_id = X OR company.industry_id = X).
+#
+# Renders as 6 boxes:
+#   integration.person ──► ref.industry             (person.industry_id — current job)
+#   integration.company ──► ref.industry            (company.industry_id — v1)
+#   integration.company ──► ref.industry_v2         (company.industry_v2_id — v2 expanded)
+#   integration.experience_industry ──► ref.industry (junction; PDL emits 1/exp)
+#   integration.experience_industry ──► integration.experience
+#   integration.experience ──► integration.person + integration.company (anchors so arrows resolve)
+#
+# Cardinality nuance (per DBML):
+#   - person.industry_id: PDL person-level $.industry — the CURRENT-job industry,
+#     not a historical aggregate. NULL for a sizeable minority of persons.
+#   - company.industry_id: COALESCE(enrichment.industry, person_experience.company_industry).
+#   - company.industry_v2_id: populated ONLY from person.experience.company.industry_v2
+#     (PDL Company Enrichment does not emit industry_v2).
+#   - experience_industry: PDL emits one row per experience.
+
+# Anchors — so cross-table FKs resolve on the diagram
+integration.person
+integration.experience
+integration.company
+
+# Junction
+integration.experience_industry
+
+# Industry ref tables
+ref.industry
+ref.industry_v2

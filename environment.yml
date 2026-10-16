@@ -1,0 +1,31 @@
+name: pdl_test
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - postgresql                       # psql CLI for local debugging; libpq bundled
+  - pip:
+      # dbt
+      - dbt-core>=1.7,<1.10
+      - dbt-postgres>=1.7,<1.10
+      # database driver
+      - psycopg2-binary>=2.9
+      # S3 access (ingester reads S3 / MinIO)
+      - boto3>=1.34
+      # PDL HTTP client (processing/common/pdl)
+      - requests>=2.31
+      # ingester source configs
+      - pyyaml>=6.0
+      # planned DBML → DDL / dbt-stub generator (modeling/scaffolding/README.md)
+      - jinja2>=3.1
+      - pydbml>=1.1
+      - click>=8.1
+      # testing — AWS / PDL calls are mocked (moto for S3 / STS)
+      - pytest>=8.0
+      - pytest-mock
+      - moto[s3,sts]>=5.0
+      # linting / formatting
+      - ruff>=0.4
+      - sqlfluff>=3.0
+      - sqlfluff-templater-dbt

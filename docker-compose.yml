@@ -1,0 +1,158 @@
+# Local dev infrastructure for pdl-test.
+#
+# One command: `make dev-up` (default profile — just postgres + flyway + fixture).
+# Engineers connect their host pgAdmin app to localhost:5432. The Python
+# ingester, dbt and tests run on the host in the `pdl_test` conda env (see
+# Makefile), not in containers.
+#
+# Profiles:
+#   (default)   postgres + flyway-init + fixture-load
+#   ingester    + minio + minio-init (S3-compatible bucket for s3_ingester e2e work)
+#
+# See docs/design/local-dev-design.md for the full architecture + rationale.
+#
+# Notes:
+#   - The ingester loads files with psycopg2 `COPY ... FROM STDIN` after
+#     downloading them via boto3, so vanilla Postgres is all it needs (no
+#     server-side S3 extension).
+#   - postgres image is pinned (18.3). Bump deliberately; a major-version
+#     bump needs `make dev-reset` (or pg_upgrade) for existing volumes.
+
+x-pg-env: &pg-env
+  POSTGRES_USER: pdl_etl
+  POSTGRES_PASSWORD: pdl_etl_dev
+  POSTGRES_DB: pdl_etl
+
+services:
+  # ──────────────────────────────────────────────────────────────────
+  # Core — always on
+  # ──────────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:18.3
+    container_name: pdl_test_postgres
+    environment:
+      <<: *pg-env
+    ports:
+      - "5432:5432"
+    volumes:
+      # postgres:18 image changed the data-directory layout: data now lives
+      # in /var/lib/postgresql/<major>/docker/ instead of /var/lib/postgresql/data.
+      # The image declares VOLUME /var/lib/postgresql, so mount the named
+      # volume there (parent dir) to avoid the "two-mounts-collide" boot
+      # failure documented at https://github.com/docker-library/postgres/pull/1259.
+      # When upgrading from 17→18 with persistent data, this layout also
+      # enables `pg_upgrade --link` cleanly.
+      - postgres_data:/var/lib/postgresql
+      - ./infra/local/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdl_etl -d pdl_etl"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot. Runs flyway migrate against the freshly-started Postgres.
+  # Same settings as modeling/flyway/flyway.conf (which host-side
+  # `flyway -configFiles=modeling/flyway/flyway.conf migrate` uses).
+  flyway-init:
+    image: flyway/flyway:12.6.1
+    container_name: pdl_test_flyway_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      -url=jdbc:postgresql://postgres:5432/pdl_etl
+      -user=pdl_etl
+      -password=pdl_etl_dev
+      -schemas=catalog,raw,pdl_api,ref,integration,staging
+      -defaultSchema=catalog
+      -baselineOnMigrate=true
+      -validateMigrationNaming=true
+      migrate
+    volumes:
+      - ./modeling/flyway/migrations:/flyway/sql:ro
+
+  # One-shot. Fetches a sanitized PDL fixture from FIXTURE_URL (if set),
+  # caches it under infra/local/fixtures-cache/, and COPYs it into
+  # raw.pdl_person. With no FIXTURE_URL and no cached file it skips
+  # gracefully. Idempotent — re-runs are fast (cache hit + TRUNCATE+COPY).
+  fixture-load:
+    image: postgres:18.3 # gives us psql + libpq for the \copy
+    container_name: pdl_test_fixture_load
+    depends_on:
+      flyway-init:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: pdl_etl
+      PGPASSWORD: pdl_etl_dev
+      PGDATABASE: pdl_etl
+      # Cache file slug: the fixture is cached as ${FIXTURE_VERSION}.csv.gz.
+      FIXTURE_VERSION: ${FIXTURE_VERSION:-pdl-person-sample-v1}
+      # Where to download the fixture from (HTTPS URL to a .csv.gz). No
+      # default — set it in your shell / .env, or drop the file into
+      # infra/local/fixtures-cache/ by hand. See fixture-load.sh.
+      FIXTURE_URL: ${FIXTURE_URL:-}
+      # If 1, skip the direct \copy into raw.pdl_person — just cache the
+      # fixture for minio-init to upload. Set by `make dev-up-ingester`
+      # so the ingester can populate raw via its own Finder→Loader path.
+      SKIP_RAW_LOAD: ${SKIP_RAW_LOAD:-0}
+    entrypoint: /bin/bash
+    command: ["/scripts/fixture-load.sh"]
+    volumes:
+      - ./infra/local/scripts:/scripts:ro
+      - ./infra/local/fixtures-cache:/cache
+
+  # ──────────────────────────────────────────────────────────────────
+  # Ingester profile — S3-compat object store for s3_ingester e2e work
+  # ──────────────────────────────────────────────────────────────────
+
+  minio:
+    image: minio/minio:latest
+    profiles: ["ingester"]
+    container_name: pdl_test_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio_local
+      MINIO_ROOT_PASSWORD: minio_local_dev
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web console (http://localhost:9001)
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot. Creates the local PDL bucket + uploads the cached fixture
+  # delivery (same file fixture-load cached) as a COMPLETED-suffixed
+  # S3 layout that processing.s3_ingester.run can consume directly.
+  minio-init:
+    image: minio/mc:latest
+    profiles: ["ingester"]
+    container_name: pdl_test_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+      fixture-load:
+        condition: service_completed_successfully
+    entrypoint: /bin/sh
+    command: ["/scripts/minio-init.sh"]
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: minio_local
+      MINIO_ROOT_PASSWORD: minio_local_dev
+      LOCAL_BUCKET: pdl-ingest-local
+      # Single source of truth is the Makefile's DELIVERY_DATE.
+      DELIVERY_DATE: ${DELIVERY_DATE:-}
+      FIXTURE_VERSION: ${FIXTURE_VERSION:-pdl-person-sample-v1}
+    volumes:
+      - ./infra/local/scripts:/scripts:ro
+      - ./infra/local/fixtures-cache:/cache:ro
+
+volumes:
+  postgres_data:
+  minio_data:

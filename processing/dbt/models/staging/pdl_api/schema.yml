@@ -1,0 +1,20 @@
+version: 2
+
+# Generic tests on staging.* models flattened from the pdl_api schema
+# (PDL API caller audit tables). Pattern parallels
+# processing/dbt/models/staging/pdl_person/schema.yml — generic tests only.
+
+models:
+  - name: pdl_api_company_parsed
+    description: |
+      PDL Company Enrichment responses (pdl_api.company_enrichment_call,
+      response_status = 200) flattened to typed columns. One row per
+      pdl_company_id, 1:1 by API contract (no _unique step — docs/design/18_pdl_api_generic_caller.md).
+      The unique test is the defensive guard if a duplicate ever appears
+      (future re-enrichment), at which point a _unique step would be added.
+    columns:
+      - name: pdl_company_id
+        description: PDL company natural key (response_json->>'id').
+        data_tests:
+          - not_null
+          - unique

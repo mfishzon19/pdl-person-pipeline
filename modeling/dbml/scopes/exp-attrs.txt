@@ -1,0 +1,28 @@
+# exp-attrs — experience + role attributes + job-title taxonomy
+# Includes person/company anchors so experience.{person_id, company_id} FK arrows render.
+# Job-title chain shown in full (structurally interesting). ref.seniority_level is
+# included as the junction target; other ref tables (industry, location) are out of
+# scope — their FK refs get stripped automatically in default strict mode.
+
+# Experience — central entity
+integration.experience
+
+# Anchors so experience.person_id / company_id arrows resolve
+integration.person
+integration.company
+
+# Experience junctions — PDL-fed
+integration.experience_location
+integration.experience_industry
+integration.experience_seniority_level
+
+# Job-title taxonomy — 3 individual ref tables, each FK'd independently from
+# integration.experience (V25 "Option E": dropped the composite-FK
+# ref.job_title_classification table; experience now has 3 FKs to these
+# ref tables to preserve partial PDL classifications).
+ref.job_title_class
+ref.job_title_role
+ref.job_title_subrole
+
+# Seniority ref table (target of experience_seniority_level junction)
+ref.seniority_level

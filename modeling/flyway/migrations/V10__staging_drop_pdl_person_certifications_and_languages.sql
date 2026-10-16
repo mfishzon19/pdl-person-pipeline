@@ -1,0 +1,31 @@
+-- =============================================================================
+-- V10__staging_drop_pdl_person_certifications_and_languages.sql
+--
+-- DROP staging.pdl_person_certifications_parsed and
+-- staging.pdl_person_languages_parsed.
+--
+-- Reason: the PDL field bundle this pipeline receives does not deliver
+-- $.certifications[*] or $.languages[*] at any nesting depth. Verified
+-- across a full monthly delivery and a sample from the following one; no
+-- keys matched `cert | lang | credential | license` patterns. The two
+-- staging tables (created in V7__staging_baseline.sql) took minutes per
+-- model on every dbt run and always inserted 0 rows.
+--
+-- The corresponding integration-layer tables
+-- (integration.person_certification, integration.person_language) are
+-- KEPT at this point (person_certification is dropped later in V16). This
+-- migration only removes the dead-end staging surface for PDL.
+--
+-- Companion dbt + DBML changes (same change):
+--   - processing/dbt/models/staging/pdl_person/pdl_person_certifications_parsed.sql  (deleted)
+--   - processing/dbt/models/staging/pdl_person/pdl_person_languages_parsed.sql       (deleted)
+--   - processing/dbt/models/staging/pdl_person/schema.yml                            (2 model entries removed)
+--   - processing/dbt/dbt_project.yml                                                 (2 Pattern 1 hook blocks removed)
+--   - modeling/dbml/staging.dbml                                                     (2 table blocks removed; note left in place)
+--
+-- IF NOT EXISTS isn't strictly needed (V7 always created these), but
+-- defending against re-apply against an already-clean DB.
+-- =============================================================================
+
+DROP TABLE IF EXISTS staging.pdl_person_certifications_parsed;
+DROP TABLE IF EXISTS staging.pdl_person_languages_parsed;

@@ -1,0 +1,67 @@
+[project]
+name = "pdl-test"
+version = "0.1.0"
+description = "PDL person ingestion, enrichment and cleansing pipeline"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Package discovery is deferred. For now, processing/ and modeling/ are imported
+# via PYTHONPATH set by the conda env / IDE config. When package install becomes
+# useful (e.g. for a distributable CLI), add explicit [tool.setuptools.packages]
+# config here.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "N",   # pep8-naming
+    "S",   # flake8-bandit (security)
+    "W",   # pycodestyle warnings
+]
+ignore = [
+    "S101",  # assert is fine in tests
+    "N818",  # exception names (NotFound, AccessDenied, ...) are public API; keep them
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S"]   # security checks off in test code
+# S608: these modules build SQL around table/column identifiers that are
+# module constants or _quote_ident()-quoted; every value is a bound parameter.
+"processing/pdl_api/base.py" = ["S608"]
+"processing/pdl_api/company_enrichment.py" = ["S608"]
+"processing/common/db/batch.py" = ["S608"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "processing/s3_ingester/tests",
+    "processing/pdl_api/tests",
+    "processing/common/preflight/tests",
+    "processing/common/aws/tests",
+    "processing/common/db/tests",
+    "processing/tests",
+]
+# Live PDL smoke tests are deselected by default; `pytest -m pdl_smoke`
+# overrides this marker expression to run them.
+addopts = '-v --tb=short -m "not pdl_smoke"'
+markers = [
+    "tier1: must-have, catches real correctness bugs",
+    "tier2: deeper coverage, add when code stabilizes",
+    "tier3: full coverage, justified for multi-engineer / regression scenarios",
+    "integration: requires a running local Postgres with the schema applied, auto-skipped unless DATABASE_URL is set",
+    "pdl_smoke: hits the real PDL API; deselected by default (addopts), skipped unless PDL_API_KEY is set. Run with `pytest -m pdl_smoke`.",
+]
+
+[tool.sqlfluff.core]
+dialect = "postgres"
+templater = "dbt"
+max_line_length = 120

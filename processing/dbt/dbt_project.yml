@@ -1,0 +1,414 @@
+name: 'pdl_test'
+version: '0.1.0'
+config-version: 2
+
+profile: 'pdl_etl'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# ADR-0009 Pattern 2 — FK constraint drop/recreate around dbt run.
+#
+# Drop ALL foreign-key constraints across `ref` and `integration` schemas
+# at the start of every dbt invocation; recreate them with `NOT VALID` at
+# the end. Eliminates the multi-thread `TRUNCATE ... CASCADE` deadlock
+# so --threads 4 builds run safely.
+#
+# - NOT VALID skips Postgres's row-by-row validation scan at recreate
+#   (huge speedup on millions of rows). Real integrity check happens via
+#   dbt's `relationships` tests in schema.yml at the same logical moment.
+# - Stateless rebuild + no live INSERTs into integration means Postgres-
+#   level per-INSERT FK enforcement protects against nothing; dbt tests
+#   are the correct enforcement layer for this architecture.
+# - Tracking state lives in catalog._dropped_fks (V15) so a mid-run abort
+#   is recoverable on the next dbt run — drop_fks detects existing rows
+#   and skips re-capture; recreate_fks replays them at on-run-end.
+#
+# Hooks run for every `dbt` invocation including `dbt test` / `dbt seed`;
+# the drop+recreate overhead is small enough not to warrant skipping them.
+# See docs/decisions/0009-fk-constraint-drop-recreate-for-rebuild.md.
+on-run-start:
+  - "{{ drop_fks(['ref', 'integration']) }}"
+
+on-run-end:
+  - "{{ recreate_fks() }}"
+
+# Materialization rules (see docs/design/02 §11 + processing/dbt/README.md):
+#
+#   All staging / integration / ref tables are Flyway-owned for DDL (DBML
+#   source: modeling/dbml/staging.dbml, integration.dbml, ref.dbml). dbt
+#   populates them via stateless full-rebuild (docs/requirements/01 §2):
+#
+#       TRUNCATE TABLE {{ this }} RESTART IDENTITY CASCADE
+#       INSERT INTO {{ this }} (cols) SELECT cols FROM ...
+#
+#   Why incremental + append + TRUNCATE pre_hook (not 'table' or 'merge'):
+#     - 'table' would DROP+CREATE the Flyway-owned table (FORBIDDEN).
+#     - 'merge' does per-row comparison; wasted work when most/all rows
+#       change every rebuild (PDL refreshes everything monthly).
+#     - 'append' + pre_hook TRUNCATE = single bulk INSERT, no comparison.
+#       RESTART IDENTITY resets surrogate sequences to match the
+#       "surrogate IDs not stable across rebuilds" contract.
+#     - CASCADE handles FK ordering automatically — dbt's DAG builds
+#       parents before children; cascade-truncate is harmless on
+#       already-empty downstream tables.
+#
+#   on_schema_change='fail' catches drift between DBML CREATE TABLE shape
+#   and dbt model SELECT shape — single source of truth enforcement.
+#
+# Schema names are bare (staging / integration / ref) thanks to the
+# generate_schema_name macro override at macros/overrides/generate_schema_name.sql —
+# without it, dbt prepends the profile target schema (e.g. dev_staging).
+models:
+  pdl_test:
+    staging:
+      +materialized: incremental
+      +incremental_strategy: append
+      +pre_hook: "TRUNCATE TABLE {{ this }} RESTART IDENTITY CASCADE"
+      +on_schema_change: fail
+      +schema: staging
+      pdl_person:
+        +tags: ["pdl"]
+        # Pattern 1 — drop indexes before INSERT, rebuild after. See
+        # docs/decisions/0003-staging-bulk-load-pattern-1.md for rationale
+        # and alternatives considered.
+        # Index lists match what Flyway creates (DBML is the source of
+        # truth — verify via `\d staging.<table>` if DBML changes).
+        pdl_person_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_parsed_partition_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_parsed_pdl_id"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_parsed_partition_id ON {{ this }} USING btree (partition_id)"
+            - "CREATE INDEX idx_pdl_person_parsed_pdl_id ON {{ this }} USING btree (pdl_id)"
+            - "ANALYZE {{ this }}"
+        pdl_person_experience_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_experience_parsed_company_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_experience_parsed_partition_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_experience_parsed_person_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_experience_parsed_dedup"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_experience_parsed_company_pdl_id ON {{ this }} USING btree (company_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_experience_parsed_partition_id ON {{ this }} USING btree (partition_id)"
+            - "CREATE INDEX idx_pdl_person_experience_parsed_person_pdl_id ON {{ this }} USING btree (person_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_experience_parsed_dedup ON {{ this }} USING btree (person_pdl_id, company_pdl_id, start_year, title_name, loaded_at DESC, partition_id DESC)"
+            - "ANALYZE {{ this }}"
+        pdl_person_education_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_education_parsed_partition_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_education_parsed_person_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_education_parsed_school_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_education_parsed_dedup"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_education_parsed_partition_id ON {{ this }} USING btree (partition_id)"
+            - "CREATE INDEX idx_pdl_person_education_parsed_person_pdl_id ON {{ this }} USING btree (person_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_education_parsed_school_pdl_id ON {{ this }} USING btree (school_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_education_parsed_dedup ON {{ this }} USING btree (person_pdl_id, school_pdl_id, start_year, (degrees::text), loaded_at DESC, partition_id DESC)"
+            - "ANALYZE {{ this }}"
+        # Parsed tables added in V12 (see docs/design/15_pdl_staging_design.md).
+        pdl_person_companies_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_companies_parsed_person_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_companies_parsed_company_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_companies_parsed_partition_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_companies_parsed_dedup"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_companies_parsed_person_pdl_id  ON {{ this }} USING btree (person_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_companies_parsed_company_pdl_id ON {{ this }} USING btree (company_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_companies_parsed_partition_id   ON {{ this }} USING btree (partition_id)"
+            - "CREATE INDEX idx_pdl_person_companies_parsed_dedup          ON {{ this }} USING btree (company_pdl_id, loaded_at DESC, partition_id DESC)"
+            - "ANALYZE {{ this }}"
+        pdl_person_schools_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_schools_parsed_person_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_schools_parsed_school_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_schools_parsed_partition_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_schools_parsed_dedup"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_schools_parsed_person_pdl_id ON {{ this }} USING btree (person_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_schools_parsed_school_pdl_id ON {{ this }} USING btree (school_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_schools_parsed_partition_id  ON {{ this }} USING btree (partition_id)"
+            - "CREATE INDEX idx_pdl_person_schools_parsed_dedup         ON {{ this }} USING btree (school_pdl_id, loaded_at DESC, partition_id DESC)"
+            - "ANALYZE {{ this }}"
+        pdl_person_addresses_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_parsed_person_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_parsed_source"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_parsed_partition_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_parsed_dedup"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_addresses_parsed_person_pdl_id ON {{ this }} USING btree (person_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_addresses_parsed_source        ON {{ this }} USING btree (source_context, source_idx)"
+            - "CREATE INDEX idx_pdl_person_addresses_parsed_partition_id  ON {{ this }} USING btree (partition_id)"
+            - "CREATE INDEX idx_pdl_person_addresses_parsed_dedup         ON {{ this }} USING btree (person_pdl_id, source_context, source_idx, loaded_at DESC, partition_id DESC)"
+            - "ANALYZE {{ this }}"
+        # Unique tables (Pattern 1 extends symmetrically per ADR-0003 — drop
+        # UNIQUE constraint pre-INSERT, recreate post-INSERT alongside indexes).
+        pdl_person_unique:
+          +pre_hook:
+            - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS pdl_person_unique_pdl_id_uk"
+          +post_hook:
+            - "ALTER TABLE {{ this }} ADD CONSTRAINT pdl_person_unique_pdl_id_uk UNIQUE (pdl_id)"
+            - "ANALYZE {{ this }}"
+        pdl_person_experience_unique:
+          +pre_hook:
+            - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS uq_pdl_person_experience_unique_nk"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_experience_unique_company_pdl_id"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_experience_unique_company_pdl_id ON {{ this }} USING btree (company_pdl_id)"
+            - "ALTER TABLE {{ this }} ADD CONSTRAINT uq_pdl_person_experience_unique_nk UNIQUE (person_pdl_id, company_pdl_id, start_year, title_name)"
+            - "ANALYZE {{ this }}"
+        pdl_person_education_unique:
+          +pre_hook:
+            - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS uq_pdl_person_education_unique_nk"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_education_unique_school_pdl_id"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_education_unique_school_pdl_id ON {{ this }} USING btree (school_pdl_id)"
+            - "ALTER TABLE {{ this }} ADD CONSTRAINT uq_pdl_person_education_unique_nk UNIQUE (person_pdl_id, school_pdl_id, start_year, degrees_text)"
+            - "ANALYZE {{ this }}"
+        pdl_person_companies_unique:
+          +pre_hook:
+            - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS uq_pdl_person_companies_unique_nk"
+          +post_hook:
+            - "ALTER TABLE {{ this }} ADD CONSTRAINT uq_pdl_person_companies_unique_nk UNIQUE (company_pdl_id)"
+            - "ANALYZE {{ this }}"
+        pdl_person_schools_unique:
+          +pre_hook:
+            - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS uq_pdl_person_schools_unique_nk"
+          +post_hook:
+            - "ALTER TABLE {{ this }} ADD CONSTRAINT uq_pdl_person_schools_unique_nk UNIQUE (school_pdl_id)"
+            - "ANALYZE {{ this }}"
+        pdl_person_addresses_unique:
+          # V22 added two partial indexes for source_context-filtered access
+          # by integration models (integration.person home_address,
+          # integration.company_hq_address). DBML can't express partial
+          # predicates — canonical DDL is V22.
+          +pre_hook:
+            - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS uq_pdl_person_addresses_unique_nk"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_unique_person_pdl_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_unique_person_home"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_person_addresses_unique_company_hq"
+          +post_hook:
+            - "CREATE INDEX idx_pdl_person_addresses_unique_person_pdl_id ON {{ this }} USING btree (person_pdl_id)"
+            - "CREATE INDEX idx_pdl_person_addresses_unique_person_home   ON {{ this }} USING btree (person_pdl_id) WHERE source_context = 'person_home' AND source_idx = 0"
+            - "CREATE INDEX idx_pdl_person_addresses_unique_company_hq    ON {{ this }} USING btree (person_pdl_id, source_idx) WHERE source_context = 'experience_company_hq'"
+            - "ALTER TABLE {{ this }} ADD CONSTRAINT uq_pdl_person_addresses_unique_nk UNIQUE (person_pdl_id, source_context, source_idx)"
+            - "ANALYZE {{ this }}"
+      # PDL Company Enrichment staging (V28). Pattern 1 (ADR-0003):
+      # drop indexes pre-INSERT, recreate post-INSERT. Index names match
+      # what V28 creates (DBML is the source of truth). The UNIQUE index
+      # backs the schema.yml unique test (1:1 by API contract — docs/design/18_pdl_api_generic_caller.md).
+      pdl_api:
+        pdl_api_company_parsed:
+          +pre_hook:
+            - "DROP INDEX IF EXISTS staging.uq_pdl_api_company_parsed_pdl_company_id"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_api_company_parsed_called_at"
+            - "DROP INDEX IF EXISTS staging.idx_pdl_api_company_parsed_bulk_batch_id"
+          +post_hook:
+            - "CREATE UNIQUE INDEX uq_pdl_api_company_parsed_pdl_company_id ON {{ this }} USING btree (pdl_company_id)"
+            - "CREATE INDEX idx_pdl_api_company_parsed_called_at ON {{ this }} USING btree (called_at DESC)"
+            - "CREATE INDEX idx_pdl_api_company_parsed_bulk_batch_id ON {{ this }} USING btree (bulk_batch_id)"
+            - "ANALYZE {{ this }}"
+    integration:
+      +materialized: incremental
+      +incremental_strategy: append
+      +pre_hook: "TRUNCATE TABLE {{ this }} RESTART IDENTITY CASCADE"
+      +on_schema_change: fail
+      +schema: integration
+      # Pattern 1 (ADR-0003) applies to every integration model, same as
+      # staging _unique tables: drop secondary indexes + UNIQUE constraint
+      # pre-INSERT, recreate post-INSERT. Loading multi-million-row tables
+      # with all indexes live forces per-row b-tree maintenance with random
+      # page access (text columns like name / full_name / linkedin_id/url
+      # scatter); bulk CREATE INDEX after INSERT is much faster.
+      #
+      # PK on `id` is NOT dropped: integration models compute `id` via
+      # ROW_NUMBER OVER (ORDER BY <natural_key>) — output rows arrive in
+      # id-order, so PK b-tree insertion is append-only at the rightmost
+      # leaf (cheap). Dropping+recreating the PK gives marginal-to-zero
+      # gain on append-only insertion.
+      #
+      # Index/constraint names match what V6 (integration baseline)
+      # created — Postgres auto-names `<table>_pkey` for the PK and
+      # `<table>_<column>_key` for inline UNIQUE. Verify via
+      # `\d integration.<table>` if names change in a future migration.
+      person:
+        +pre_hook:
+          - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS person_pdl_id_key"
+          - "DROP INDEX IF EXISTS integration.idx_person_full_name"
+          - "DROP INDEX IF EXISTS integration.idx_person_linkedin_id"
+          - "DROP INDEX IF EXISTS integration.idx_person_linkedin_url"
+          - "DROP INDEX IF EXISTS integration.idx_person_industry_id"
+          - "DROP INDEX IF EXISTS integration.idx_person_location_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_full_name    ON {{ this }} USING btree (full_name)"
+          - "CREATE INDEX idx_person_linkedin_id  ON {{ this }} USING btree (linkedin_id)"
+          - "CREATE INDEX idx_person_linkedin_url ON {{ this }} USING btree (linkedin_url)"
+          - "CREATE INDEX idx_person_industry_id  ON {{ this }} USING btree (industry_id)"
+          - "CREATE INDEX idx_person_location_id  ON {{ this }} USING btree (location_id)"
+          - "ALTER TABLE {{ this }} ADD CONSTRAINT person_pdl_id_key UNIQUE (pdl_id)"
+          - "ANALYZE {{ this }}"
+      company:
+        # V23 trimmed integration.company to 4 secondary indexes (under the
+        # 8-per-table convention); ticker, linkedin_id, industry_v2_id and
+        # the parent-id columns are deliberately unindexed. Re-add via an
+        # additive migration if a real consumer query needs them.
+        +pre_hook:
+          - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS company_pdl_company_id_key"
+          - "DROP INDEX IF EXISTS integration.idx_company_name"
+          - "DROP INDEX IF EXISTS integration.idx_company_website"
+          - "DROP INDEX IF EXISTS integration.idx_company_location_id"
+          - "DROP INDEX IF EXISTS integration.idx_company_industry_id"
+        +post_hook:
+          - "CREATE INDEX idx_company_name                ON {{ this }} USING btree (name)"
+          - "CREATE INDEX idx_company_website             ON {{ this }} USING btree (website)"
+          - "CREATE INDEX idx_company_location_id         ON {{ this }} USING btree (location_id)"
+          - "CREATE INDEX idx_company_industry_id         ON {{ this }} USING btree (industry_id)"
+          - "ALTER TABLE {{ this }} ADD CONSTRAINT company_pdl_company_id_key UNIQUE (pdl_company_id)"
+          - "ANALYZE {{ this }}"
+      # company_affiliation junction (V28). Pattern 1: drop the 2 secondary
+      # indexes pre-INSERT, recreate post-INSERT. The composite PK stays
+      # (ROW_NUMBER isn't used — rows arrive in scan order — but the junction
+      # is small, so per-row PK maintenance is negligible).
+      # The 2 inbound FKs to integration.company + the FK to
+      # ref.pdl_relationship are handled by the global drop_fks/recreate_fks
+      # hooks (on-run-start/end), same as every other integration FK.
+      company_affiliation:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_company_affiliation_affiliated_company_id"
+          - "DROP INDEX IF EXISTS integration.idx_company_affiliation_relationship_id"
+        +post_hook:
+          - "CREATE INDEX idx_company_affiliation_affiliated_company_id ON {{ this }} USING btree (affiliated_company_id)"
+          - "CREATE INDEX idx_company_affiliation_relationship_id ON {{ this }} USING btree (relationship_id)"
+          - "ANALYZE {{ this }}"
+      experience:
+        # V25 trimmed integration.experience indexes: dropped
+        # idx_experience_is_primary (bool col, doesn't pay back),
+        # idx_experience_classification_id (column dropped — Option E
+        # replaced composite FK with 3 individual FKs; no indexes
+        # added on those 3 since no current query pattern needs them),
+        # idx_experience_start_date (column dropped — switched to
+        # start_year int4 with no index). Surviving 3 secondaries:
+        # person_id, company_id, title.
+        #
+        # V27 added (person_id, experience_idx) composite index
+        # (idx_experience_person_idx) — JOIN key from per-experience
+        # junction models (experience_location/_industry/_seniority_level).
+        # Replaces the slow 4-col natural-key COALESCE join.
+        #
+        # No UNIQUE constraint on integration.experience (no natural-key
+        # uniqueness at the integration layer — surrogate id is the PK
+        # and natural-key dedup happens at staging.pdl_person_experience
+        # _unique). Pattern 1 hooks just drop/recreate the 4 secondary
+        # indexes; PK stays (ROW_NUMBER ORDER BY natural key makes PK
+        # insertion append-only).
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_experience_person_id"
+          - "DROP INDEX IF EXISTS integration.idx_experience_company_id"
+          - "DROP INDEX IF EXISTS integration.idx_experience_title"
+          - "DROP INDEX IF EXISTS integration.idx_experience_person_idx"
+        +post_hook:
+          - "CREATE INDEX idx_experience_person_id  ON {{ this }} USING btree (person_id)"
+          - "CREATE INDEX idx_experience_company_id ON {{ this }} USING btree (company_id)"
+          - "CREATE INDEX idx_experience_title      ON {{ this }} USING btree (title)"
+          - "CREATE INDEX idx_experience_person_idx ON {{ this }} USING btree (person_id, experience_idx)"
+          - "ANALYZE {{ this }}"
+      # School + junction tables (V26).
+      # Pattern 1: drop secondary indexes pre-INSERT, recreate post-INSERT.
+      # Composite-PK junctions (person_country / _state_province / etc.)
+      # leave the PK in place — bulk INSERT order doesn't easily align
+      # with a multi-col PK index, but the per-row index update cost on
+      # narrow junction rows is acceptable; revisit if it shows up in timings.
+      school:
+        +pre_hook:
+          - "ALTER TABLE {{ this }} DROP CONSTRAINT IF EXISTS school_pdl_id_key"
+          - "DROP INDEX IF EXISTS integration.idx_school_name"
+          - "DROP INDEX IF EXISTS integration.idx_school_domain"
+          - "DROP INDEX IF EXISTS integration.idx_school_linkedin_id"
+          - "DROP INDEX IF EXISTS integration.idx_school_location_id"
+        +post_hook:
+          - "CREATE INDEX idx_school_name        ON {{ this }} USING btree (name)"
+          - "CREATE INDEX idx_school_domain      ON {{ this }} USING btree (domain)"
+          - "CREATE INDEX idx_school_linkedin_id ON {{ this }} USING btree (linkedin_id)"
+          - "CREATE INDEX idx_school_location_id ON {{ this }} USING btree (location_id)"
+          - "ALTER TABLE {{ this }} ADD CONSTRAINT school_pdl_id_key UNIQUE (pdl_id)"
+          - "ANALYZE {{ this }}"
+      person_education:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_person_education_person_id"
+          - "DROP INDEX IF EXISTS integration.idx_person_education_school_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_education_person_id ON {{ this }} USING btree (person_id)"
+          - "CREATE INDEX idx_person_education_school_id ON {{ this }} USING btree (school_id)"
+          - "ANALYZE {{ this }}"
+      person_country:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_person_country_country_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_country_country_id ON {{ this }} USING btree (country_id)"
+          - "ANALYZE {{ this }}"
+      person_state_province:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_person_state_province_state_province_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_state_province_state_province_id ON {{ this }} USING btree (state_province_id)"
+          - "ANALYZE {{ this }}"
+      person_location:
+        # Empty stub today — see model header. Hooks still run to
+        # keep the table consistent with the stateless-rebuild contract.
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_person_location_location_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_location_location_id ON {{ this }} USING btree (location_id)"
+          - "ANALYZE {{ this }}"
+      person_skill:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_person_skill_skill_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_skill_skill_id ON {{ this }} USING btree (skill_id)"
+          - "ANALYZE {{ this }}"
+      person_interest:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_person_interest_interest_id"
+        +post_hook:
+          - "CREATE INDEX idx_person_interest_interest_id ON {{ this }} USING btree (interest_id)"
+          - "ANALYZE {{ this }}"
+      person_language:
+        # Empty stub today — no secondary index in DBML; hooks still
+        # ANALYZE for plan stability across rebuilds.
+        +post_hook:
+          - "ANALYZE {{ this }}"
+      experience_location:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_experience_location_location_id"
+        +post_hook:
+          - "CREATE INDEX idx_experience_location_location_id ON {{ this }} USING btree (location_id)"
+          - "ANALYZE {{ this }}"
+      experience_industry:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_experience_industry_industry_id"
+        +post_hook:
+          - "CREATE INDEX idx_experience_industry_industry_id ON {{ this }} USING btree (industry_id)"
+          - "ANALYZE {{ this }}"
+      experience_seniority_level:
+        +pre_hook:
+          - "DROP INDEX IF EXISTS integration.idx_experience_seniority_level_seniority_level_id"
+        +post_hook:
+          - "CREATE INDEX idx_experience_seniority_level_seniority_level_id ON {{ this }} USING btree (seniority_level_id)"
+          - "ANALYZE {{ this }}"
+    ref:
+      +materialized: incremental
+      +incremental_strategy: append
+      +pre_hook: "TRUNCATE TABLE {{ this }} RESTART IDENTITY CASCADE"
+      +on_schema_change: fail
+      +schema: ref

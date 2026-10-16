@@ -1,0 +1,69 @@
+-- =============================================================================
+-- V23 — Drop 5 unused / redundant secondary indexes on integration.company.
+--
+-- WHY:
+-- After the V6 baseline (7 secondary indexes) and V16 (+2 industry FK
+-- indexes), integration.company carried 9 secondary indexes + PK + UNIQUE,
+-- 11 indexes in total. The project convention of at most 8 indexes per table
+-- prefers a tighter secondary-index footprint; integration.company was the
+-- only table over. Decisions per index:
+--
+--   idx_company_immediate_parent_id (drop)  — enrichment-only column;
+--                                             always NULL at the time, index
+--                                             was dead weight. Re-add if
+--                                             enrichment queries need it.
+--   idx_company_ultimate_parent_id  (drop)  — same as above.
+--   idx_company_industry_v2_id      (drop)  — paired with industry_id (v1
+--                                             taxonomy). Both are populated
+--                                             from the same company sub-object;
+--                                             redundant access pattern.
+--                                             Consumers can use industry_id
+--                                             (v1) which is the simpler /
+--                                             established enum. Re-add when
+--                                             company enrichment brings richer
+--                                             industry_v2 semantics if needed.
+--   idx_company_ticker              (drop)  — only public companies (a small
+--                                             fraction of the dataset) have a
+--                                             ticker. No current consumer
+--                                             queries by ticker. Add back if
+--                                             search by ticker becomes a real
+--                                             workflow.
+--   idx_company_linkedin_id         (drop)  — no current consumer queries
+--                                             integration.company by linkedin_id
+--                                             (cross-source matching happens
+--                                             at the person layer via
+--                                             integration.person.linkedin_id).
+--                                             Add back when a query pattern
+--                                             demands it.
+--
+-- Surviving secondary indexes on integration.company (4, plus PK + UNIQUE
+-- = 6 indexes total — under the 8-per-table convention):
+--   idx_company_name         — search by company name (user-facing lookups)
+--   idx_company_website      — useful for cross-source matching
+--   idx_company_location_id  — filter by location
+--   idx_company_industry_id  — filter by industry (v1, populated from
+--                              experience.company.industry)
+--
+-- BLAST RADIUS:
+--   - All 5 indexes are on an EMPTY table (integration.company was never
+--     populated by any dbt model before V21).
+--   - The Pattern 1 hooks in dbt_project.yml that drop+recreate these indexes
+--     around the integration.company dbt model INSERT are updated in the same
+--     change — once V23 lands, the hooks no longer reference the dropped indexes.
+--   - DBML (modeling/dbml/integration.dbml) Indexes block updated in the same
+--     change to reflect the new index list.
+--   - No FK constraints reference the dropped index column patterns (FKs reference
+--     columns by oid; index drops don't affect them).
+--   - DROP INDEX is a fast metadata operation on an empty table — applies in
+--     under 100ms total for all 5.
+--
+-- See also: V22__staging_pdl_person_addresses_partial_indexes.sql (sister
+-- migration in the same change, addressing the addresses-side perf via partial
+-- indexes — a different "right-size the index set" exercise).
+-- =============================================================================
+
+DROP INDEX IF EXISTS integration.idx_company_immediate_parent_id;
+DROP INDEX IF EXISTS integration.idx_company_ultimate_parent_id;
+DROP INDEX IF EXISTS integration.idx_company_industry_v2_id;
+DROP INDEX IF EXISTS integration.idx_company_ticker;
+DROP INDEX IF EXISTS integration.idx_company_linkedin_id;

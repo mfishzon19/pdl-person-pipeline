@@ -1,0 +1,245 @@
+version: 2
+
+# Generic tests for ref.* models populated from PDL staging. Tests describe
+# the ref shape, not the upstream source.
+#
+# No Pattern 1 hooks for ref tables (small row counts, index maintenance
+# during INSERT is negligible).
+
+models:
+  - name: skill
+    description: |
+      PDL skill vocabulary. Sourced from pdl_person_parsed.skills jsonb
+      array. No UNIQUE on name (per ref.dbml — skill strings are noisy;
+      cross-source dedup is future work).
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+
+  - name: interest
+    description: |
+      PDL interest vocabulary. Sourced from pdl_person_parsed.interests
+      jsonb array.
+    columns:
+      - name: name
+        # ref.interest.name is nullable in DBML / V4 (unlike ref.skill.name).
+        # This not_null test deliberately overshoots the DBML — the model's
+        # WHERE clause keeps the test safe in practice and we want to catch
+        # any future loosening of the WHERE filter.
+        data_tests:
+          - not_null
+
+  - name: industry
+    description: |
+      PDL industry vocabulary. Sourced from pdl_person_parsed.industry
+      scalar. source_type hardcoded to 'pdl'.
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+          - unique
+      - name: source_type
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ['pdl']
+
+  - name: industry_v2
+    description: |
+      PDL canonical industry v2 (expanded enum). Sourced from
+      pdl_person_companies_unique.company_industry_v2 — industry_v2
+      lives only on the company sub-object, not at the person top
+      level. PDL-only; no source_type discriminator.
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+          - unique
+
+  - name: job_title_class
+    description: |
+      PDL canonical title.class vocabulary. Sourced from
+      pdl_person_experience_parsed.title_class.
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+          - unique
+
+  - name: job_title_role
+    description: PDL canonical title.role vocabulary.
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+          - unique
+
+  - name: job_title_subrole
+    description: PDL canonical title.sub_role vocabulary.
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+          - unique
+
+  # ref.job_title_classification was dropped in V25. The composite
+  # dim (class+role+sub_role) was replaced by 3 individual FKs on
+  # integration.experience to preserve partial classifications PDL emits.
+  # See V25 migration body + integration.experience block in integration.dbml.
+
+  - name: seniority_level
+    description: |
+      PDL title.levels[] vocabulary ("manager", "director", "cxo",
+      "senior", "partner", etc). Sourced from
+      pdl_person_experience_parsed.title_levels jsonb array.
+    columns:
+      - name: name
+        data_tests:
+          - not_null
+          - unique
+
+  # ---------------------------------------------------------------------
+  # Location ref hierarchy. Sourced from
+  # pdl_person_addresses_unique. Source-context-agnostic —
+  # person_home / experience_company_hq / education_school collapse to
+  # DISTINCT vocab.
+  # ---------------------------------------------------------------------
+
+  - name: continent
+    description: |
+      DISTINCT continent values from pdl_person_addresses_unique.
+      Source-context-agnostic. The display_name column was dropped from
+      this table in V12 (no canonical third-party source for it).
+    columns:
+      - name: name_lc
+        data_tests:
+          - not_null
+          - unique
+
+  - name: country
+    description: |
+      DISTINCT country values + continent_id resolved via LEFT JOIN to
+      ref.continent. iso_alpha_2, iso_alpha_3 currently NULL (future
+      seed). display_name dropped in V12. continent_id populated from
+      PDL data (overrides DBML's conservative "future seed" note);
+      NULL where the source row lacked continent.
+    columns:
+      - name: name_lc
+        data_tests:
+          - not_null
+          - unique
+      - name: continent_id
+        data_tests:
+          - relationships:
+              to: ref('continent')
+              field: id
+
+  - name: state_province
+    description: |
+      DISTINCT (country, region) tuples. country_id NOT NULL (rows whose
+      country didn't resolve are filtered out by the INNER JOIN).
+      UNIQUE on (country_id, name_lc).
+    columns:
+      - name: country_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('country')
+              field: id
+      - name: name_lc
+        data_tests:
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: ['country_id', 'name_lc']
+
+  - name: city
+    description: |
+      DISTINCT (country, region, locality) tuples. state_province_id
+      nullable (PDL often emits locality without region). V5 created the
+      COALESCE-based unique index on
+      (country_id, COALESCE(state_province_id, 0), name_lc).
+    columns:
+      - name: country_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('country')
+              field: id
+      - name: state_province_id
+        data_tests:
+          - relationships:
+              to: ref('state_province')
+              field: id
+      - name: name_lc
+        data_tests:
+          - not_null
+
+  - name: metro
+    description: |
+      DISTINCT (country, metro) tuples. msa_code currently NULL (future
+      seed). display_name dropped in V12. UNIQUE on (country_id, name_lc).
+    columns:
+      - name: country_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('country')
+              field: id
+      - name: name_lc
+        data_tests:
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: ['country_id', 'name_lc']
+
+  - name: location
+    description: |
+      Composite junction — one row per distinct (country, state_province,
+      city, metro) tuple. country_id NOT NULL; other FKs nullable. V5
+      created the COALESCE-based unique index on
+      (country_id, COALESCE(state_province_id, 0), COALESCE(city_id, 0),
+       COALESCE(metro_id, 0)).
+    columns:
+      - name: country_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('country')
+              field: id
+      - name: state_province_id
+        data_tests:
+          - relationships:
+              to: ref('state_province')
+              field: id
+      - name: city_id
+        data_tests:
+          - relationships:
+              to: ref('city')
+              field: id
+      - name: metro_id
+        data_tests:
+          - relationships:
+              to: ref('metro')
+              field: id
+
+  # ---------------------------------------------------------------------
+  # PDL company relationship-type vocabulary (V28). Loader-
+  # discovered from staging.pdl_api_company_parsed.affiliated_entities[].
+  # relationship per ADR-0011 — no seed. Junctioned via
+  # integration.company_affiliation.relationship_id.
+  # ---------------------------------------------------------------------
+
+  - name: pdl_relationship
+    description: |
+      PDL company relationship types (direct_subsidiary,
+      indirect_subsidiary, immediate_parent, ultimate_parent at the time
+      of writing). Loader-discovered from
+      staging.pdl_api_company_parsed.affiliated_entities[].relationship;
+      new PDL values are picked up automatically on the next rebuild.
+    columns:
+      - name: relationship
+        data_tests:
+          - not_null
+          - unique

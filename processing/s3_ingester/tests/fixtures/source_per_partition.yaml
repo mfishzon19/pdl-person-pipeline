@@ -1,0 +1,8 @@
+# Test fixture. Partitioned-mode source config with replace_strategy: per_partition.
+column_list: payload
+copy_options: "FORMAT csv"
+bucket: test-bucket
+region: us-east-1
+partition_column: partition_id
+partition_value_type: smallint
+replace_strategy: per_partition

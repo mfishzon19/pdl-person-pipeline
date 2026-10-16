@@ -1,0 +1,28 @@
+# dbt connection config for the local Docker Postgres (docker-compose).
+#
+# Setup (one-time):
+#   cd processing/dbt
+#   cp profiles.yml.example profiles.yml
+#
+# Every value can be overridden with a DBT_PG_* env var; the defaults match
+# the docker-compose Postgres service (db `pdl_etl`, user `pdl_etl`,
+# password `pdl_etl_dev`, localhost:5432). Use DBT_PG_HOST=postgres when
+# running inside a container on the compose network.
+#
+# Layer schemas (staging / ref / integration) come from the per-layer
+# +schema configs in dbt_project.yml via macros/overrides/generate_schema_name.sql;
+# the profile `schema` below is only dbt's required default.
+
+pdl_etl:
+  target: "{{ env_var('DBT_TARGET', 'local') }}"
+  outputs:
+    local:
+      type: postgres
+      host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"
+      port: "{{ env_var('DBT_PG_PORT', '5432') | as_number }}"
+      user: "{{ env_var('DBT_PG_USER', 'pdl_etl') }}"
+      password: "{{ env_var('DBT_PG_PASSWORD', 'pdl_etl_dev') }}"
+      dbname: "{{ env_var('DBT_PG_DBNAME', 'pdl_etl') }}"
+      schema: "{{ env_var('DBT_PG_SCHEMA', 'dev_local') }}"
+      threads: 4
+      keepalives_idle: 0

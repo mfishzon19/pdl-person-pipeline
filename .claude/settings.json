@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git blame*)",
+      "Bash(git ls-files*)",
+      "Bash(git ls-remote*)",
+      "Bash(git ls-tree*)",
+      "Bash(git rev-parse*)",
+      "Bash(git rev-list*)",
+      "Bash(git describe*)",
+      "Bash(git shortlog*)",
+      "Bash(git reflog*)",
+      "Bash(git whatchanged*)",
+      "Bash(git cherry*)",
+      "Bash(git archive*)",
+      "Bash(aws sso *)",
+      "Bash(aws sts *)",
+      "Bash(aws s3 *)",
+      "Bash(awk *)",
+      "Bash(java -version)",
+      "Bash(flyway --version)",
+      "Bash(dbt *)"
+    ]
+  }
+}

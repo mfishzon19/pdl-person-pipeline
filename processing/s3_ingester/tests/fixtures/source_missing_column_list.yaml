@@ -1,0 +1,4 @@
+# Test fixture. Missing the required `column_list` key.
+copy_options: "FORMAT csv"
+bucket: test-bucket
+region: us-east-1

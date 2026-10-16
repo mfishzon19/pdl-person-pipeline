@@ -1,0 +1,46 @@
+-- =============================================================================
+-- V11__staging_drop_pdl_person_profiles_parsed.sql
+--
+-- DROP staging.pdl_person_profiles_parsed.
+--
+-- Reason: profile_id is NULL on every row of pdl_person_profiles_parsed
+-- (verified against a full delivery).
+-- The natural-key candidates for pdl_person_profiles_unique all included
+-- profile_id (`(person_pdl_id, network, profile_id)`), making dedup
+-- structurally broken — NULL profile_ids can't be told apart in SQL.
+--
+-- The four major social networks (LinkedIn, Facebook, Twitter, GitHub)
+-- that integration.person_social_network covers are already present as
+-- top-level scalars on staging.pdl_person_parsed:
+--   - linkedin_id, linkedin_url, linkedin_username, linkedin_connections
+--   - facebook_id, facebook_url, facebook_username, facebook_friends
+--   - twitter_url, twitter_username
+--   - github_url, github_username
+--
+-- LinkedIn lives on integration.person directly (canonical primary, per
+-- the integration.person_social_network DBML note). The remaining three
+-- networks will be sourced into integration.person_social_network via
+-- a pivot of the top-level scalars at the integration dbt model layer
+-- (integration work done separately).
+--
+-- Accepted data loss: minor networks beyond FB/Twitter/GitHub
+-- (Instagram, Stack Overflow, Pinterest, etc.) and per-profile
+-- first_seen / last_seen / num_sources timestamps. Low value for the
+-- person-search use case.
+--
+-- The integration-layer table integration.person_social_network is KEPT
+-- — its DDL remains unchanged; only its source path moves from
+-- pdl_person_profiles_parsed to top-level scalars on pdl_person_parsed.
+--
+-- Companion changes (same change as V11):
+--   - processing/dbt/models/staging/pdl_person/pdl_person_profiles_parsed.sql  (deleted)
+--   - processing/dbt/models/staging/pdl_person/schema.yml                      (profiles entry removed)
+--   - processing/dbt/dbt_project.yml                                           (profiles Pattern 1 hooks removed)
+--   - modeling/dbml/staging.dbml                                               (block removed; note left in place)
+--   - docs/design/15_pdl_staging_design.md                                     (profiles dropped from staging surface table)
+--
+-- IF NOT EXISTS isn't strictly needed (V7 always created this table),
+-- but defending against re-apply against an already-clean DB.
+-- =============================================================================
+
+DROP TABLE IF EXISTS staging.pdl_person_profiles_parsed;

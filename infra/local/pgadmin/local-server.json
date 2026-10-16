@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Local pdl_etl (Docker)",
+      "Group": "Servers",
+      "Host": "localhost",
+      "Port": 5432,
+      "MaintenanceDB": "pdl_etl",
+      "Username": "pdl_etl",
+      "SSLMode": "prefer",
+      "Comment": "Local Docker Postgres for pdl-test. Connects to the postgres service published on localhost:5432 by docker-compose.yml. Password is 'pdl_etl_dev' — pgAdmin will prompt on first connect."
+    }
+  }
+}

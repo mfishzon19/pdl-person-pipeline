@@ -1,0 +1,66 @@
+// =============================================================================
+// raw.dbml — raw landing tables (PDL person + delta files).
+//
+// Source of truth for the raw schema. Authored by hand; do NOT edit
+// generated downstream artifacts.
+//
+// Partitioning model (per design Section 5):
+//   - 1:1 with source files
+//   - PDL: PARTITION BY LIST (partition_id smallint)  [file index]
+//   - Lazy leaf creation: V2 only creates parent tables; leaves are created
+//     by the Python Ingester (in the same transaction as the COPY) on first
+//     ingest of each partition value.
+//
+// DBML caveat: PARTITION BY clauses are not native DBML. They're declared in
+// the generated/hand-authored V2__raw_baseline.sql alongside each CREATE TABLE.
+// Each Note: below records the partition column for the scaffolding compiler.
+//
+// Spec reference: docs/design/02_pipeline_design.md Section 5.
+// Generated artifact: modeling/flyway/migrations/V2__raw_baseline.sql.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// PDL content (1 table) — full monthly snapshot
+// -----------------------------------------------------------------------------
+
+Table raw.pdl_person {
+  partition_id smallint [not null, note: 'File index 0..N within a delivery; matches part-NNNNN.csv.gz']
+  payload      jsonb [not null, note: 'Full PDL person record, untouched from source']
+  loaded_at    timestamptz [not null]
+
+  Note: 'PDL full snapshot. One leaf per part file of the monthly delivery (hundreds of files). PARTITION BY LIST (partition_id). Latest-only: each new delivery TRUNCATEs each leaf and re-COPYs.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL deltas (3 tables) — small per-record delta files; projected to catalog ledger
+//
+// File format: PDL ships JSONL (one JSON object per line, gzipped) despite
+// .csv.gz / .gz extensions. The Ingester gunzips each file (detected by the
+// .gz suffix or the object's Content-Encoding header) and COPYs it as a
+// single-column "CSV" (delimiter and quote set to bytes JSON can't contain),
+// landing each line as one jsonb row.
+// -----------------------------------------------------------------------------
+
+Table raw.pdl_merged_records {
+  partition_id smallint [not null]
+  payload      jsonb [not null, note: '{"id": "<old_pdl_id>", "merged_to": "<new_pdl_id>"} per row']
+  loaded_at    timestamptz [not null]
+
+  Note: 'PDL MERGED_RECORDS delta files. Projected to catalog.pdl_id_aliases + catalog.merge_events by R__function_project_pdl_deltas.sql. PARTITION BY LIST (partition_id).'
+}
+
+Table raw.pdl_deleted_records {
+  partition_id smallint [not null]
+  payload      jsonb [not null, note: '{"id": "<pdl_id>"} per row']
+  loaded_at    timestamptz [not null]
+
+  Note: 'PDL DELETED_RECORDS delta files. Projected to catalog.pdl_inactive (reason=deleted) by R__function_project_pdl_deltas.sql. PARTITION BY LIST (partition_id).'
+}
+
+Table raw.pdl_opted_out_records {
+  partition_id smallint [not null]
+  payload      jsonb [not null, note: '{"id": "<pdl_id>"} per row']
+  loaded_at    timestamptz [not null]
+
+  Note: 'PDL OPTED_OUT_RECORDS delta files (may be absent entirely; see OQ-3a in docs/requirements/01_pipeline_requirements.md). Projected to catalog.pdl_inactive (reason=opted_out). PARTITION BY LIST (partition_id).'
+}

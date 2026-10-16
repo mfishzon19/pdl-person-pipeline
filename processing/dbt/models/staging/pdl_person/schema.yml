@@ -1,0 +1,282 @@
+version: 2
+
+# Generic tests on staging.pdl_person_* models.
+#
+# Convention: generic tests live next to the models they describe. Singular
+# tests (one bespoke SQL each, expected to return zero rows) live in
+# processing/dbt/tests/.
+#
+# Schema-defining columns (full column lists with types) are NOT hand-authored
+# here today — they'd be regenerated from modeling/dbml/staging.dbml by the
+# scaffolding compiler (modeling/scaffolding/ — not yet implemented). For now
+# we only declare the columns we want to attach tests to. Once the compiler
+# ships, this file will be regenerated with all columns, and hand-written
+# tests will be preserved on the columns they target.
+
+models:
+  - name: pdl_person_parsed
+    description: |
+      PDL person top-level scalar flatten via JSON_TABLE. One row per
+      raw.pdl_person record (1:1 with raw). No PK; multiple rows per
+      pdl_id allowed (dedup at pdl_person_unique).
+    columns:
+      - name: pdl_id
+        description: PDL natural key. NOT unique on this table.
+        data_tests:
+          - not_null
+
+  - name: pdl_person_experience_parsed
+    description: |
+      PDL experience[] unnested via JSON_TABLE NESTED PATH. One row per
+      (raw.pdl_person record × experience entry). No PK; dedup at
+      pdl_person_experience_unique.
+    columns:
+      - name: person_pdl_id
+        description: PDL person id (parent record). NOT unique on this table.
+        data_tests:
+          - not_null
+      - name: experience_idx
+        description: 1-based array position within $.experience[*].
+        data_tests:
+          - not_null
+
+  - name: pdl_person_education_parsed
+    description: |
+      PDL education[] unnested via JSON_TABLE NESTED PATH. One row per
+      (raw.pdl_person record × education entry). Raw records with empty /
+      missing education[] are filtered out at the SELECT level. No PK;
+      dedup at pdl_person_education_unique.
+    columns:
+      - name: person_pdl_id
+        description: PDL person id (parent record). NOT unique on this table.
+        data_tests:
+          - not_null
+      - name: education_idx
+        description: 1-based array position within $.education[*].
+        data_tests:
+          - not_null
+      - name: start_year
+        description: |
+          Year extracted from PDL education[].start_date. PDL ships the
+          field as "yyyy", "yyyy-mm", or "yyyy-mm-dd"; we keep only the
+          year. NULL when PDL did not send a date.
+      - name: end_year
+        description: |
+          Year extracted from PDL education[].end_date. Same rule as
+          start_year.
+
+  - name: pdl_person_addresses_parsed
+    description: |
+      PDL addresses unified across 3 source paths via UNION ALL
+      (person_home, experience_company_hq, education_school). source_idx=0
+      for top-level (person_home), = experience_idx / education_idx for
+      nested. Branch 3 (education_school) has only continent / country /
+      region / locality populated; other location columns NULL. See
+      docs/design/15 decision #3 (street_address / address_line_2 are PDL
+      bool-placeholders, hardcoded NULL).
+    columns:
+      - name: person_pdl_id
+        data_tests:
+          - not_null
+      - name: source_context
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ['person_home', 'experience_company_hq', 'education_school']
+      - name: source_idx
+        data_tests:
+          - not_null
+
+  - name: pdl_person_addresses_unique
+    description: |
+      PDL addresses deduplicated by (person_pdl_id, source_context,
+      source_idx). One row per source-position identity. Dedup
+      ordering: loaded_at DESC, partition_id DESC (uniform placeholder).
+    columns:
+      - name: partition_id
+        description: Ingester provenance — winning row's PDL file partition index.
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: Ingester provenance — winning row's loaded_at.
+        data_tests:
+          - not_null
+      - name: person_pdl_id
+        data_tests:
+          - not_null
+      - name: source_context
+        data_tests:
+          - not_null
+      - name: source_idx
+        data_tests:
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: ['person_pdl_id', 'source_context', 'source_idx']
+
+  - name: pdl_person_experience_unique
+    description: |
+      PDL experience deduplicated by 4-column natural key
+      (person_pdl_id, company_pdl_id, start_year, title_name).
+      title_name preserves promotion-style multi-title rows that a
+      3-column key would have wrong-merged. Dedup ordering:
+      loaded_at DESC, partition_id DESC (uniform placeholder).
+    columns:
+      - name: partition_id
+        description: Ingester provenance — winning row's PDL file partition index.
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: Ingester provenance — winning row's loaded_at.
+        data_tests:
+          - not_null
+      - name: person_pdl_id
+        data_tests:
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: ['person_pdl_id', 'company_pdl_id', 'start_year', 'title_name']
+
+  - name: pdl_person_education_unique
+    description: |
+      PDL education deduplicated by 4-column natural key
+      (person_pdl_id, school_pdl_id, start_year, degrees_text) where
+      degrees_text is degrees::text, written by the model's SELECT (a
+      UNIQUE constraint can't target a jsonb expression directly).
+      Rows with empty degrees still merge cleanly. Dedup ordering:
+      loaded_at DESC, partition_id DESC (uniform placeholder).
+    columns:
+      - name: partition_id
+        description: Ingester provenance — winning row's PDL file partition index.
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: Ingester provenance — winning row's loaded_at.
+        data_tests:
+          - not_null
+      - name: person_pdl_id
+        data_tests:
+          - not_null
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: ['person_pdl_id', 'school_pdl_id', 'start_year', 'degrees_text']
+
+  # No pdl_person_profiles_parsed model: it was dropped in V11 because PDL
+  # does not populate profile ids, so profiles[] could not be deduplicated.
+
+  - name: pdl_person_companies_parsed
+    description: |
+      PDL experience[].company sub-object flattened via JSON_TABLE NESTED
+      PATH. One row per (raw.pdl_person record × experience entry that has
+      a company). Source for pdl_person_companies_unique.
+    columns:
+      - name: person_pdl_id
+        description: PDL person id (parent record). NOT unique on this table.
+        data_tests:
+          - not_null
+      - name: experience_idx
+        description: 1-based array position within $.experience[*].
+        data_tests:
+          - not_null
+
+  - name: pdl_person_companies_unique
+    description: |
+      Dedup of pdl_person_companies_parsed by company_pdl_id. One row per
+      unique company. Dedup ordering: loaded_at DESC, partition_id
+      DESC (uniform placeholder). NULL company_pdl_id filtered at the SELECT
+      level (experiences PDL didn't link to a tracked company don't
+      contribute to the dim).
+    columns:
+      - name: partition_id
+        description: Ingester provenance — winning row's PDL file partition index.
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: Ingester provenance — winning row's loaded_at.
+        data_tests:
+          - not_null
+      - name: company_pdl_id
+        description: PDL company id. UNIQUE on this table.
+        data_tests:
+          - not_null
+          - unique
+          - relationships:
+              to: ref('pdl_person_companies_parsed')
+              field: company_pdl_id
+
+  - name: pdl_person_schools_parsed
+    description: |
+      PDL education[].school sub-object flattened via JSON_TABLE NESTED
+      PATH. One row per (raw.pdl_person record × education entry that has
+      a school). Source for pdl_person_schools_unique.
+    columns:
+      - name: person_pdl_id
+        description: PDL person id (parent record). NOT unique on this table.
+        data_tests:
+          - not_null
+      - name: education_idx
+        description: 1-based array position within $.education[*].
+        data_tests:
+          - not_null
+
+  - name: pdl_person_schools_unique
+    description: |
+      Dedup of pdl_person_schools_parsed by school_pdl_id. One row per
+      unique school. Same dedup ordering as companies_unique.
+    columns:
+      - name: partition_id
+        description: Ingester provenance — winning row's PDL file partition index.
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: Ingester provenance — winning row's loaded_at.
+        data_tests:
+          - not_null
+      - name: school_pdl_id
+        description: PDL school id. UNIQUE on this table.
+        data_tests:
+          - not_null
+          - unique
+          - relationships:
+              to: ref('pdl_person_schools_parsed')
+              field: school_pdl_id
+
+  - name: pdl_person_unique
+    description: |
+      PDL person deduplicated + recursively alias-resolved via
+      catalog.pdl_id_aliases. One row per current pdl_id. Columns:
+      provenance, record metadata, pdl_id, names, bio, inferred, contact
+      (work_email), PDL freshness dates, LinkedIn social fields (plus
+      facebook_friends), and 5 jsonb text arrays. NOT a mirror of
+      pdl_person_parsed — the current-job (job_*) and person-home
+      (location_*) columns are omitted because they duplicate
+      $.experience[is_primary=true] and pdl_person_addresses_parsed.
+
+      Alias resolution walks multi-hop chains with a recursive CTE (PDL
+      re-merges ids across deliveries) and collapses 2-cycles to
+      LEAST(A, B). Singular tests (severity warn):
+      pdl_person_unique_alias_cycle_guard.sql surfaces alias cycles;
+      pdl_person_unique_alias_hop_cap.sql surfaces chains that hit the
+      recursive CTE's hops=10 cap.
+
+      No `relationships` test from pdl_id → pdl_person_parsed.pdl_id —
+      alias-resolved ids can be current_pdl_ids that don't exist in raw
+      (PDL retired the old, the new lives only in the alias ledger). A
+      naïve FK-style relationships test would false-fail.
+    columns:
+      - name: partition_id
+        description: Ingester provenance — winning row's PDL file partition index.
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: Ingester provenance — winning row's loaded_at.
+        data_tests:
+          - not_null
+      - name: pdl_id
+        description: |
+          PDL natural key, alias-resolved via catalog.pdl_id_aliases.
+          UNIQUE on this table (enforced both by the dbt unique test and
+          the DDL-level UNIQUE constraint recreated by post_hook).
+        data_tests:
+          - not_null
+          - unique

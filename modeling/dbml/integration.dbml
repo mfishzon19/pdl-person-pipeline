@@ -1,0 +1,445 @@
+// =============================================================================
+// integration.dbml — conformed entity tables (person, company, school,
+// experience) + their junctions
+//
+// Source of truth for the integration schema. Authored by hand; do NOT edit
+// generated downstream artifacts (Flyway migrations, dbt schema.yml).
+//
+// Spec references:
+//   - docs/data_model/08_company.md — `integration.company` (both source shapes)
+//   - docs/data_model/12_location.md — location modeling (now scalar-only on integration.person + integration.company per V20/V24; no separate address table)
+//   - docs/data_model/13_person.md   — `integration.person` and all junctions
+//
+// Population:
+//   - PDL-sourced: person + experience + person_education + school +
+//     company (basic columns from person experience; enrichment-only columns
+//     populated from PDL Company Enrichment where available, NULL otherwise
+//     — see doc 08) + all PDL-fed junctions.
+//   - Per-edge `source` on experience_industry records which source attested
+//     the edge ('pdl').
+//
+// Rebuild policy: integration.* rebuilds on every run from raw + catalog
+// ledger. Surrogate IDs are NOT stable across rebuilds — downstream consumers
+// use natural keys (pdl_id) or internal_person_id from catalog.person_key_map.
+//
+// Surrogate id strategy: dbt-computed ROW_NUMBER in each integration model's
+// SELECT (ADR-0010, applied in V20 — extends ADR-0008's ref.* treatment to integration.*).
+// Every `id bigint [pk]` column is materialized in Postgres as a plain bigint
+// PRIMARY KEY (no GENERATED ALWAYS AS IDENTITY clause). The dbt SELECT must
+// project `id` explicitly via ROW_NUMBER OVER (ORDER BY <natural_key>). Use
+// `pdl_id` / `pdl_company_id` where the table has one; the staging composite
+// natural key otherwise. See V20__integration_drop_identity_and_person_scalar_address.sql.
+//
+// PLANNED CHANGE — the value (not the mechanism): ADR-0007 + docs/requirements/01
+// §4.2 say integration.person.id is the stable internal_person_id from
+// catalog.person_key_map (looked up via identity_signature, same section).
+// The rebuild-local ROW_NUMBER value is an INTENTIONAL PLACEHOLDER — future
+// identity-resolution work populates
+// catalog.person_key_map and swaps the integration models' id expression to
+// JOIN against it. No data migration needed (stateless rebuild). See
+// ADR-0010 §"What this ADR is NOT — identity resolution" for the full rationale
+// and the one-line dbt change identity-resolution implementers will make.
+//
+// Cross-system identifiers do NOT live on integration.person — they belong
+// in catalog.person_key_map. See doc 13 §7.
+//
+// PDL meta columns NOT on integration.person (V16 cleanup, verified against
+// a full delivery):
+//   - dataset_version + operation_id → catalog.pdl_person_provenance (future)
+//   - first_seen / num_sources / num_records → unsourced; never populated,
+//     keys absent from the PDL JSON this pipeline receives
+//   - Real per-record freshness signals (job_last_changed, job_last_verified,
+//     location_last_updated) ADDED to integration.person — see doc 14 §2.
+//
+// Tables removed in V16 (no source; see the comment block where they used
+// to sit): person_social_network, person_name_alias, person_certification.
+//
+// DBML caveats (handled by hand-authored sidecar migrations):
+//   - Trigram indexes on integration.experience.title (DBML can't express GIN/trgm).
+//   - Convenience views (integration.v_person_denorm, v_experience_denorm,
+//     ref.v_location_denorm — see doc 13 §11 and doc 12 §7) will land as
+//     R__view_*.sql migrations.
+// =============================================================================
+
+Project pdl_etl_integration {
+  database_type: 'PostgreSQL'
+  Note: 'PDL ETL — integration schema. Conformed Person, Company, School, Experience + junctions. Address data is inline scalars on the relevant entity tables (V20 for person, V24 for company); no separate address table.'
+}
+
+// -----------------------------------------------------------------------------
+// Person — the central entity (doc 13 §4.1)
+//
+// Historical note: V6 created integration.address as a shared per-entity
+// street-level table (person + company). V20 inlined scalars on
+// integration.person (Option C — person tier has no street-level PDL data).
+// V21 renamed integration.address → integration.company_hq_address and
+// added pdl_company_id as a dbt-DAG join key. V24 recognized
+// that company is 1:1 with its HQ address by construction (PDL emits
+// company.location as a single object — verified) and inlined the
+// scalars on integration.company too. The integration.company_hq_address
+// table was dropped entirely in V24. Doc 12 §4.7.
+// -----------------------------------------------------------------------------
+
+Table integration.person {
+  id                          bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY pdl_id); not stable across rebuilds. See ADR-0010 (extension of ADR-0008 to integration.*; applied in V20).']
+  pdl_id                      text        [unique, not null, note: 'PDL natural key. UNIQUE NOT NULL — loaders ON CONFLICT (pdl_id) DO UPDATE.']
+  first_name                  text
+  middle_name                 text
+  middle_initial              text        [note: 'Length 1.']
+  last_name                   text
+  last_initial                text        [note: 'Length 1.']
+  full_name                   text        [note: 'PDL concatenated.']
+  headline                    text        [note: 'PDL headline. Often a PDL bool-placeholder rather than real text.']
+  summary                     text        [note: 'PDL person.summary. Often a PDL bool-placeholder rather than real text.']
+  industry_id                 bigint      [ref: > ref.industry.id, note: 'FK to ref.industry; resolved from PDL person.industry.']
+  linkedin_id                 text
+  linkedin_url                text
+  linkedin_username           text
+  location_id                 bigint      [ref: > ref.location.id, note: 'Always populated when PDL emits any location data.']
+  latitude                    "numeric(9,6)" [note: 'Parsed from PDL location.geo ("lat,lng") for source_context=person_home, source_idx=0 row in pdl_person_addresses_unique. Scalar address shape (V20): person home is scalar-only because PDL person tier has no street-level data. Same Option C pattern was applied to integration.company in V24.']
+  longitude                   "numeric(9,6)" [note: 'Parsed from PDL location.geo. Same person_home source row as latitude.']
+  postal_code                 text        [note: 'PDL location.postal_code for the person_home address. NULL when PDL emits no postal data.']
+  sex                         text
+  work_email                  text
+  job_last_changed            timestamptz [note: 'PDL freshness signal — when the current job last changed per PDL. Populated for most but not all persons. Used by identity resolution + job-history recency logic; missing values need an explicit NULL strategy (see doc 14 §2).']
+  job_last_verified           timestamptz [note: 'PDL freshness signal — when PDL last verified the current employment. Populated for most but not all persons. Same NULL-handling caveat as job_last_changed.']
+  location_last_updated       timestamptz [note: 'PDL freshness signal — when PDL last updated location info. Populated for most but not all persons. Same NULL-handling caveat.']
+  timestamp_created           timestamptz [not null, default: `now()`]
+  timestamp_modified          timestamptz [not null, default: `now()`]
+
+  Indexes {
+    full_name      [name: 'idx_person_full_name']
+    linkedin_id    [name: 'idx_person_linkedin_id']
+    linkedin_url   [name: 'idx_person_linkedin_url']
+    industry_id    [name: 'idx_person_industry_id']
+    location_id    [name: 'idx_person_location_id']
+  }
+
+  Note: 'Conformed Person. Cross-system identifiers live in catalog.person_key_map — NOT on this table. Doc 13 §4.1 + §7. PII excluded by design: no birth_date / birth_year / mobile_phone / emails[] / phone_numbers[] (PDL bool-placeholders in the field bundle this pipeline receives). PDL meta cols (dataset_version, operation_id, num_sources, num_records, first_seen) NOT here: dataset_version + operation_id move to catalog.pdl_person_provenance (future); num_sources/num_records/first_seen unsourced (never populated; keys absent from the PDL JSON this pipeline receives). Address shape (V20): scalar latitude/longitude/postal_code on this table; no person.address_id. integration.company applies the same Option C pattern (V24). No separate address table in the integration schema.'
+}
+
+// -----------------------------------------------------------------------------
+// Company (doc 08 — full schema: person-experience + enrichment scalar columns)
+// -----------------------------------------------------------------------------
+
+Table integration.company {
+  id                              bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY pdl_company_id); not stable across rebuilds. See ADR-0010 (extension of ADR-0008 to integration.*; applied in V20).']
+  pdl_company_id                  text        [unique, not null, note: 'PDL natural key.']
+  source                          text        [not null, note: "'person_experience' | 'enrichment' | 'affiliation_stub'. CASE at SELECT time, highest fidelity wins: 'enrichment' when LEFT JOIN to staging.pdl_api_company_parsed matched, else 'person_experience' when LEFT JOIN to staging.pdl_person_experience_unique matched, else 'affiliation_stub' (orphan referenced only by another company's affiliated_entities[]). See doc 08 §6.3/§6.4."]
+
+  // Shared scalar columns — both sources emit; populated via COALESCE(enrichment, person_experience)
+  name                            text
+  size                            text        [note: 'PDL canonical size band: "10001+", "51-200", …']
+  founded                         smallint    [note: 'Founding year.']
+  industry_id                     bigint      [ref: > ref.industry.id, note: 'FK to ref.industry; resolved from COALESCE(enrichment.industry, person_experience.company_industry). V16 refactored from text to FK.']
+  industry_v2_id                  bigint      [ref: > ref.industry_v2.id, note: 'FK to ref.industry_v2; populated from person.experience.company.industry_v2 only — PDL Company Enrichment does not emit industry_v2 (verified against enrichment responses — absent in all of them).']
+  type                            text        [note: "'public' | 'private' | 'educational' | 'non_profit' | 'government'"]
+  website                         text
+  linkedin_id                     text
+  linkedin_url                    text
+  facebook_url                    text
+  twitter_url                     text
+  ticker                          text        [note: 'Populated only if type=public.']
+
+  // Enrichment-only scalar columns — NULL when not enriched
+  display_name                    text        [note: 'PDL Company Enrichment $.display_name. NULL when not enriched.']
+  linkedin_slug                   text        [note: 'PDL Company Enrichment $.linkedin_slug. NULL when not enriched.']
+  mic_exchange                    text        [note: 'PDL Company Enrichment $.mic_exchange. Plain text — no FK to a ref table (scope decision: ref.mic_exchange is NOT being created; mic_exchange data lives as this scalar). NULL when not enriched.']
+  summary                         text        [note: 'PDL Company Enrichment $.summary. NULL when not enriched.']
+  headline                        text        [note: 'PDL Company Enrichment $.headline. NULL when not enriched.']
+  employee_count                  int4        [note: 'PDL Company Enrichment $.employee_count. NULL when not enriched.']
+  inferred_revenue                text        [note: 'PDL Company Enrichment $.inferred_revenue. Band string (e.g. "$10B+"). NULL when not enriched.']
+  immediate_parent_id             bigint      [ref: > integration.company.id, note: 'Self-FK. Source: PDL Company Enrichment $.immediate_parent (text scalar — the parent''s pdl_company_id, NOT a nested object). Resolved via LEFT JOIN to integration.company.pdl_company_id. Unknown parents land as affiliation_stub rows (doc 08 §6.4), so the JOIN resolves. Populated for a minority of enriched companies.']
+  ultimate_parent_id              bigint      [ref: > integration.company.id, note: 'Self-FK. Same shape as immediate_parent_id; populated for a minority of enriched companies.']
+  total_funding_raised            bigint      [note: 'PDL Company Enrichment $.total_funding_raised. USD. NULL when not enriched.']
+  latest_funding_stage            text        [note: 'PDL Company Enrichment $.latest_funding_stage. NULL when not enriched.']
+  last_funding_date               date        [note: 'PDL Company Enrichment $.last_funding_date. NULL when not enriched.']
+  number_funding_rounds           smallint    [note: 'PDL Company Enrichment $.number_funding_rounds. NULL when not enriched.']
+  dataset_version                 text        [note: 'PDL Company Enrichment $.dataset_version. NULL when not enriched.']
+  likelihood                      smallint    [note: 'PDL Company Enrichment $.likelihood (PDL match confidence, 0-10). NULL when not enriched.']
+
+  // Multi-valued enrichment columns — V28 (scope decision: jsonb on the entity, not separate junction tables)
+  naics_codes                     jsonb       [note: 'PDL Company Enrichment $.naics[]. Array of rich classification objects {sector, naics_code, sub_sector, industry_group, naics_industry, national_industry} — stored as-is, not flattened. Present on most enriched companies. NULL when not enriched. V28.']
+  sic_codes                       jsonb       [note: 'PDL Company Enrichment $.sic[]. Array of rich classification objects {sic_code, major_group, industry_group, industry_sector}. Present on most enriched companies. NULL when not enriched. V28.']
+  tags                            jsonb       [note: 'PDL Company Enrichment $.tags[]. Array of bare display-tag strings. Present on most enriched companies. NULL when not enriched. V28.']
+  alternative_names               jsonb       [note: 'PDL Company Enrichment $.alternative_names[]. Array of bare strings — alternative legal/trading names. NULL when not enriched. V28.']
+  alternative_domains             jsonb       [note: 'PDL Company Enrichment $.alternative_domains[]. Array of bare strings. NULL when not enriched. V28.']
+  funding_stages                  jsonb       [note: 'PDL Company Enrichment $.funding_stages[]. Array of bare strings — per-round funding history. NULL when not enriched. V28.']
+  employee_count_by_country       jsonb       [note: 'PDL Company Enrichment $.employee_count_by_country. Object {country_name: count}. Can be wide — global companies list many countries. NULL when not enriched. V28.']
+  profiles                        jsonb       [note: 'PDL Company Enrichment $.profiles[]. Array of multi-platform social URLs (LinkedIn, Twitter, Facebook, Crunchbase, etc.) — network names kept as free text inside the array; not normalized. Distinct from the linkedin_url scalar (which only carries one LinkedIn). NULL when not enriched. V28.']
+
+  // Common — populated by both sources via COALESCE
+  location_id                     bigint      [ref: > ref.location.id, note: 'Always populated when PDL emits any location data. Resolved via 4-way ref chain from COALESCE(enrichment.location.*, person_experience.company_location.*).']
+  latitude                        "numeric(9,6)" [note: 'Parsed from PDL company.location.geo ("lat,lng"). Inline scalar per V24 — same Option C pattern as integration.person (V20). PDL emits company.location as a single object (verified against a full delivery), so one row per company by construction. COALESCE between enrichment and person_experience.']
+  longitude                       "numeric(9,6)" [note: 'Parsed from PDL company.location.geo. Inline scalar per V24.']
+  postal_code                     text        [note: 'PDL company.location.postal_code.']
+  street_address                  text        [note: 'PDL company.location.street_address. Only part of the companies seen via person.experience carry street-level data; enrichment provides it for enriched companies.']
+  address_line_2                  text        [note: 'PDL company.location.address_line_2.']
+  fetched_at                      timestamptz [note: 'For enriched rows: pdl_api.company_enrichment_call.called_at (actual API-call time). For non-enriched: pipeline run timestamp.']
+  timestamp_created               timestamptz [not null, default: `now()`]
+  timestamp_modified              timestamptz [not null, default: `now()`]
+
+  Indexes {
+    name                  [name: 'idx_company_name']
+    website               [name: 'idx_company_website']
+    location_id           [name: 'idx_company_location_id']
+    industry_id           [name: 'idx_company_industry_id']
+  }
+
+  Note: 'Conformed Company. Three sources populate this table via single-pass LEFT JOIN + COALESCE in dbt: (1) person.experience.company (the baseline — every company a person has worked at; the 12 shared scalars), (2) PDL Company Enrichment (the enriched subset; populates all columns), (3) affiliated_entities[] stubs (companies referenced by an enriched company but not in our person.experience or enrichment sets — preserves referential integrity for the affiliation junction). The source column carries 3 values: person_experience | enrichment | affiliation_stub. See doc 08 §6.3-§6.4. V28 added 8 jsonb columns (naics_codes / sic_codes / tags / alternative_names / alternative_domains / funding_stages / employee_count_by_country / profiles) for multi-valued enrichment data — jsonb in lieu of separate junction tables because the data is display / per-entity attribute and not searched by canonical value. Hierarchy / affiliations live in integration.company_affiliation (V28). V28 also introduced the stub-insert pattern: orphan affiliated_id refs land as stub rows (only pdl_company_id + name + source = ''affiliation_stub'' populated; all other scalars + jsonb NULL). Stubs are ephemeral — they exist only as long as some currently-staged enrichment response references them in affiliated_entities[]. Address shape (V24): scalar latitude / longitude / postal_code / street_address / address_line_2 inlined directly on this table — same Option C pattern as integration.person (V20). Secondary indexes were right-sized in V23: dropped idx_company_ticker, idx_company_linkedin_id, idx_company_industry_v2_id, idx_company_immediate_parent_id, idx_company_ultimate_parent_id. Surviving secondary indexes (4) + PK + UNIQUE on pdl_company_id = 6 indexes total, under the 8-per-table convention.'
+}
+
+// -----------------------------------------------------------------------------
+// Company affiliation — parent/subsidiary junction (V28, doc 08 §4.2)
+// -----------------------------------------------------------------------------
+
+Table integration.company_affiliation {
+  subject_company_id    bigint      [not null, ref: > integration.company.id, note: "The company whose enrichment response carried this affiliation (the 'subject' from PDL's POV)."]
+  affiliated_company_id bigint      [not null, ref: > integration.company.id, note: "Other side of the relationship. Resolved via JOIN: affiliated_entities[].affiliated_id (text pdl_company_id) → integration.company.pdl_company_id → id. Always resolves under the stub-insert pattern (V28) — orphan affiliated_ids land as stub rows in integration.company, so INNER JOIN here never drops rows. See doc 08 §6.4."]
+  relationship_id       bigint      [not null, ref: > ref.pdl_relationship.id, note: 'FK → ref.pdl_relationship. Loader-discovered ref table (4 values: direct_subsidiary | indirect_subsidiary | immediate_parent | ultimate_parent). See ADR-0011.']
+  status_id             bigint      [note: 'Nullable. FK reserved for the future Parent Subsidiary Details extension — ref.pdl_relationship_status will be created when PDL starts emitting affiliated_entities[].status. Not yet a hard FK (ref table does not exist yet).']
+  catalyst_id           bigint      [note: 'Nullable. FK reserved for the future Parent Subsidiary Details extension — ref.pdl_relationship_catalyst will be created when PDL starts emitting affiliated_entities[].catalyst. Not yet a hard FK.']
+  dataset_version       text        [note: 'PDL $.dataset_version of the carrying enrichment response. Captures which response asserted this edge — used for refresh diffing when re-enrichment lands.']
+  timestamp_created     timestamptz [not null, default: `now()`]
+  timestamp_modified    timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (subject_company_id, affiliated_company_id, relationship_id) [pk]
+    affiliated_company_id                                         [name: 'idx_company_affiliation_affiliated_company_id']
+    relationship_id                                               [name: 'idx_company_affiliation_relationship_id']
+  }
+
+  Note: 'Company hierarchy + parent/subsidiary relationships. Sourced exclusively from PDL Company Enrichment $.affiliated_entities[] (each element {affiliated_id, display_name, relationship} becomes one row). PDL''s sibling denormalizations ($.affiliated_profiles, $.direct_subsidiaries, $.all_subsidiaries) carry the same ID set and are dropped — see doc 08 §5.2. display_name from the source element is NOT stored on the junction — derivable from integration.company.name on the affiliated row via JOIN (set by the stub-insert if the affiliated company isn''t otherwise known). status_id and catalyst_id are nullable, reserved for the future Parent Subsidiary Details extension to PDL''s Premium bundle. dataset_version captures which enrichment response asserted the edge — used for refresh diffing. V28 added the table.'
+}
+
+// -----------------------------------------------------------------------------
+// School (doc 13 §4.4)
+// -----------------------------------------------------------------------------
+
+Table integration.school {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY pdl_id); not stable across rebuilds. See ADR-0010 (extension of ADR-0008 to integration.*; applied in V20).']
+  pdl_id              text        [unique, not null, note: 'PDL natural key for the school.']
+  name                text
+  domain              text
+  type                text        [note: "'university' | 'secondary school' | etc. (PDL canon)"]
+  website             text
+  linkedin_id         text
+  linkedin_url        text
+  facebook_url        text
+  twitter_url         text
+  location_id         bigint      [ref: > ref.location.id, note: 'PDL school location is coarse-grain only (continent/country/region/locality — no street, no metro). Doc 12 §5.']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    name        [name: 'idx_school_name']
+    domain      [name: 'idx_school_domain']
+    linkedin_id [name: 'idx_school_linkedin_id']
+    location_id [name: 'idx_school_location_id']
+  }
+
+  Note: 'PDL education[].school. No address_id — PDL emits no street-level data for schools.'
+}
+
+// -----------------------------------------------------------------------------
+// Experience — junction of person × company + role attributes (doc 13 §4.2)
+// -----------------------------------------------------------------------------
+
+Table integration.experience {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY (person_pdl_id, company_pdl_id, start_year, title_name); not stable across rebuilds. See ADR-0010.']
+  person_id           bigint      [not null, ref: > integration.person.id]
+  experience_idx      int4        [note: 'PDL array position within $.experience[*] for the source row, carried through staging.pdl_person_experience_unique.experience_idx. Combined with person_id, uniquely identifies each integration.experience row. JOIN key for per-experience junction models (experience_location / _industry / _seniority_level) — fast integer compare vs the slow 4-col natural-key COALESCE join the V6/V25 design implied. Added in V27.']
+  company_id          bigint      [ref: > integration.company.id, note: 'NULL when PDL emits experience without a company.id (a sizeable share of staging experiences).']
+  start_year          int4        [note: 'Year experience started (4-digit). PDL emits year-only precision.']
+  end_year            int4        [note: 'Year experience ended (4-digit). NULL = current position (year-only convention; was timestamptz pre-V25).']
+  title               text        [note: 'Raw PDL experience.title.name. Btree indexed (V6). Trigram index deferred — DBML caveat anticipated consumer queries but no consumer exists yet; add via additive migration when a measured need emerges.']
+  title_class_id      bigint      [ref: > ref.job_title_class.id, note: 'FK to ref.job_title_class. Independent of role/sub_role FKs — Option E (V25) treats each enum dimension as independently nullable to preserve partial classifications (PDL emits a noticeable share of experiences with class+role but no sub_role).']
+  title_role_id       bigint      [ref: > ref.job_title_role.id, note: 'FK to ref.job_title_role. Nullable independently of title_class_id and title_sub_role_id.']
+  title_sub_role_id   bigint      [ref: > ref.job_title_subrole.id, note: 'FK to ref.job_title_subrole. NULL more often than class_id / role_id — sub_role is the most-frequently-missing classification dimension.']
+  is_primary          bool        [note: 'PDL experience.is_primary — true for the current role. Not indexed (V25 dropped idx_experience_is_primary; bool indexes don''t pay back at low cardinality).']
+  summary             text        [note: 'PDL experience.summary.']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    person_id                       [name: 'idx_experience_person_id']
+    company_id                      [name: 'idx_experience_company_id']
+    title                           [name: 'idx_experience_title']
+    (person_id, experience_idx)     [name: 'idx_experience_person_idx']
+  }
+
+  Note: 'PDL experience[] junction with attributes. V25 design pivot: composite-FK job_title_classification → 3 individual FKs (title_class_id, title_role_id, title_sub_role_id) per Option E, captures partial classifications PDL emits. start_date/end_date timestamptz → start_year/end_year int4 (year-only precision). V27 added experience_idx column + (person_id, experience_idx) index to enable fast integer-keyed JOINs from per-experience junction models (replaces the slow 4-col natural-key COALESCE join). 4 secondary indexes + PK = 5 total, still under the 8-per-table convention. Doc 13 §4.2.'
+}
+
+// -----------------------------------------------------------------------------
+// Person ⇄ Education (doc 13 §4.3)
+// -----------------------------------------------------------------------------
+
+Table integration.person_education {
+  id                  bigint         [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY (person_pdl_id, school_pdl_id, start_year, degrees_text); not stable across rebuilds. See ADR-0010 (extension of ADR-0008 to integration.*; applied in V20).']
+  person_id           bigint         [not null, ref: > integration.person.id]
+  school_id           bigint         [ref: > integration.school.id]
+  start_year          int4           [note: 'Year education started (4-digit). PDL emits education[].start_date with year-only precision; staging carries int4 to match. Was timestamptz pre-V26.']
+  end_year            int4           [note: 'Year education ended (4-digit). NULL when PDL emitted no end_date. Was timestamptz pre-V26.']
+  degrees             jsonb          [note: 'PDL education[].degrees — array of strings.']
+  majors              jsonb          [note: 'PDL education[].majors.']
+  minors              jsonb          [note: 'PDL education[].minors.']
+  gpa                 "numeric(4,2)"
+  summary             text           [note: 'PDL education[].summary.']
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    person_id [name: 'idx_person_education_person_id']
+    school_id [name: 'idx_person_education_school_id']
+  }
+
+  Note: 'PDL education[]. degrees/majors/minors stay jsonb (per-education arrays; no useful cross-entity grouping). V26 switched start_date/end_date timestamptz → start_year/end_year int4 (mirrors V25 experience pivot — PDL year-only precision). Doc 13 §4.3.'
+}
+
+// -----------------------------------------------------------------------------
+// Person — multi-valued attribute junctions (PDL-sourced; doc 13 §4.10-§4.13)
+// -----------------------------------------------------------------------------
+
+Table integration.person_country {
+  person_id           bigint         [not null, ref: > integration.person.id]
+  country_id          bigint         [not null, ref: > ref.country.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (person_id, country_id) [pk]
+    country_id              [name: 'idx_person_country_country_id']
+  }
+
+  Note: 'PDL countries[] — derived set of all countries associated with the person.'
+}
+
+Table integration.person_state_province {
+  person_id           bigint         [not null, ref: > integration.person.id]
+  state_province_id   bigint         [not null, ref: > ref.state_province.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (person_id, state_province_id) [pk]
+    state_province_id              [name: 'idx_person_state_province_state_province_id']
+  }
+
+  Note: 'PDL regions[] — derived set of all regions associated with the person.'
+}
+
+Table integration.person_location {
+  person_id           bigint         [not null, ref: > integration.person.id]
+  location_id         bigint         [not null, ref: > ref.location.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (person_id, location_id) [pk]
+    location_id              [name: 'idx_person_location_location_id']
+  }
+
+  Note: 'PDL location_names[] resolved through ref.location chain.'
+}
+
+Table integration.person_skill {
+  person_id           bigint         [not null, ref: > integration.person.id]
+  skill_id            bigint         [not null, ref: > ref.skill.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (person_id, skill_id) [pk]
+    skill_id              [name: 'idx_person_skill_skill_id']
+  }
+
+  Note: 'PDL skills[].'
+}
+
+Table integration.person_interest {
+  person_id           bigint         [not null, ref: > integration.person.id]
+  interest_id         bigint         [not null, ref: > ref.interest.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (person_id, interest_id) [pk]
+    interest_id              [name: 'idx_person_interest_interest_id']
+  }
+
+  Note: 'PDL interests[].'
+}
+
+Table integration.person_language {
+  person_id           bigint         [not null, ref: > integration.person.id]
+  language_id         bigint         [not null, ref: > ref.language.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (person_id, language_id) [pk]
+  }
+
+  Note: 'PDL languages[]. PDL proficiency (1-5) is dropped; add proficiency int4 column when downstream needs it. V26 added timestamp_created / timestamp_modified to match the rest of the integration.* junction convention. Doc 13 §4.13.'
+}
+
+// -----------------------------------------------------------------------------
+// person_social_network / person_name_alias / person_certification — REMOVED
+// in V16. All three had no source:
+//   - person_social_network: PDL emits LinkedIn-only data, already on
+//     integration.person.linkedin_* scalars; github/twitter/facebook are
+//     bool-placeholders.
+//   - person_name_alias: PDL name_aliases[] is never populated in a full
+//     delivery.
+//   - person_certification: PDL certifications[] dropped from staging in V10
+//     (not delivered in the PDL field bundle this pipeline receives).
+// Re-add when a real source emerges.
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Experience — multi-valued attribute junctions (doc 13 §4.7-§4.9)
+// -----------------------------------------------------------------------------
+
+Table integration.experience_location {
+  experience_id       bigint         [not null, ref: > integration.experience.id]
+  location_id         bigint         [not null, ref: > ref.location.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (experience_id, location_id) [pk]
+    location_id                  [name: 'idx_experience_location_location_id']
+  }
+
+  Note: 'PDL experience[].location_names[] resolved through ref.location.'
+}
+
+Table integration.experience_industry {
+  experience_id       bigint         [not null, ref: > integration.experience.id]
+  industry_id         bigint         [not null, ref: > ref.industry.id]
+  source              text           [not null, note: "Per-edge source attestation: 'pdl'. ref.industry.source_type tracks where each industry NAME first appeared; this column tracks which source attested THIS edge."]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (experience_id, industry_id) [pk]
+    industry_id                  [name: 'idx_experience_industry_industry_id']
+  }
+
+  Note: 'Multi-valued industries per experience role. PDL populates from company.industry (one row per experience). V26 added timestamp_created / timestamp_modified to match the rest of the integration.* junction convention.'
+}
+
+Table integration.experience_seniority_level {
+  experience_id       bigint         [not null, ref: > integration.experience.id]
+  seniority_level_id  bigint         [not null, ref: > ref.seniority_level.id]
+  timestamp_created   timestamptz    [not null, default: `now()`]
+  timestamp_modified  timestamptz    [not null, default: `now()`]
+
+  Indexes {
+    (experience_id, seniority_level_id) [pk]
+    seniority_level_id                  [name: 'idx_experience_seniority_level_seniority_level_id']
+  }
+
+  Note: 'PDL experience[].title.levels[] — a title can map to multiple levels ("manager" + "director").'
+}

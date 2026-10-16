@@ -1,0 +1,16 @@
+# places — pure geo hierarchy
+# 6-table chain: continent -> country -> state_province -> city -> metro -> location.
+# Purpose: review the geo schema in isolation.
+#
+# Note: an earlier 14-table version included person/company/school/junctions
+# (everything with a location_id or country_id FK). It rendered too dense — 6 incoming
+# arrows on ref.location made the diagram unreadable. The pure-hierarchy version below
+# is the canonical "places" scope.
+
+# Geo hierarchy
+ref.continent
+ref.country
+ref.state_province
+ref.city
+ref.metro
+ref.location

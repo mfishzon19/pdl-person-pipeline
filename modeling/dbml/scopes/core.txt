@@ -1,0 +1,24 @@
+# core — central entity skeleton
+# The 5 main entities + their cross-entity FKs + ref.location as a leaf.
+# No junctions. Other ref dimensions (industry, skill, job-title taxonomy,
+# etc.) are out of scope here; see person-attrs + exp-attrs scopes for those.
+# Purpose: 30-second answer to "what entities exist and how are they related?"
+# Renders as 6 boxes with ~8 FK arrows between them.
+#
+# Note: integration.address (was originally a 6th core entity) was renamed
+# to integration.company_hq_address in V21 and then dropped entirely in V24.
+# Address scalars now live inline on integration.person (V20) and
+# integration.company (V24); no separate address entity in core.
+
+# Core entities
+integration.person
+integration.company
+integration.school
+integration.experience
+integration.person_education
+
+# Geo leaf — ref.location's own FKs to continent/country/state_province/city/metro
+# get stripped automatically (out of scope), so ref.location appears as a leaf
+# node showing only its inbound arrows from person + company + school.
+# For the full geo hierarchy, see scopes/places.txt.
+ref.location

@@ -1,0 +1,8 @@
+# Test fixture. Partitioned-mode source config with replace_strategy: full.
+column_list: payload
+copy_options: "FORMAT csv, DELIMITER E'\x01', QUOTE E'\x02'"
+bucket: test-bucket
+region: us-east-1
+partition_column: partition_id
+partition_value_type: smallint
+replace_strategy: full

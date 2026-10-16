@@ -1,0 +1,415 @@
+version: 2
+
+# Generic tests on integration.* dbt models.
+#
+# Pattern parallels processing/dbt/models/staging/pdl_person/schema.yml and
+# processing/dbt/models/ref/schema.yml — generic tests only; full column
+# lists with types will be scaffold-generated from modeling/dbml/
+# integration.dbml when the compiler ships.
+#
+# `relationships` tests are the referential-integrity check: DB-side FKs on
+# ref.* / integration.* are dropped before each dbt run and recreated
+# NOT VALID afterwards, so dbt tests do the validation (see ADR-0009).
+
+models:
+  - name: person
+    description: |
+      Conformed Person (PDL). One row per resolved PDL person.
+      pdl_id is the alias-resolved canonical id from staging.pdl_person_unique.
+      Sourced from pdl_person_unique + pdl_person_addresses_unique (person_home
+      row) + ref.industry + ref.location chain.
+    columns:
+      - name: id
+        description: Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY pdl_id). Not stable across rebuilds.
+        data_tests:
+          - not_null
+          - unique
+      - name: pdl_id
+        description: PDL natural key, alias-resolved (from staging.pdl_person_unique).
+        data_tests:
+          - not_null
+          - unique
+      - name: industry_id
+        description: FK to ref.industry. NULL when PDL emits no industry for this person.
+        data_tests:
+          - relationships:
+              to: ref('industry')
+              field: id
+      - name: location_id
+        description: FK to ref.location. NULL when PDL emits no person_home location.
+        data_tests:
+          - relationships:
+              to: ref('location')
+              field: id
+
+  - name: company
+    description: |
+      Conformed Company (PDL, 3-source merge). One row per distinct
+      pdl_company_id across person.experience + affiliated_entities[].
+      Sourced via single-pass LEFT JOIN + COALESCE from (1)
+      staging.pdl_person_companies_unique (baseline: every company seen on
+      a person; 12 shared scalars + location), (2) staging.pdl_api_company_parsed
+      (the enriched subset — wins on shared scalars, populates
+      enrichment-only scalars + 8 jsonb cols), (3) affiliated_entities[]
+      stubs (orphan affiliated companies — only pdl_company_id + name +
+      source populated). See docs/data_model/08 §6.3-§6.4.
+    columns:
+      - name: id
+        description: Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY pdl_company_id). Not stable across rebuilds. A future catalog.company_key_map.internal_company_id could replace it if cross-source company resolution is ever needed (docs/data_model/08 §8).
+        data_tests:
+          - not_null
+          - unique
+      - name: pdl_company_id
+        description: PDL natural key. Stable across rebuilds; the consumer-facing identifier for cross-source joins.
+        data_tests:
+          - not_null
+          - unique
+      - name: source
+        description: 'Provenance tier, computed at SELECT via CASE — highest fidelity wins: enrichment > person_experience > affiliation_stub (docs/data_model/08 §6.3).'
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ['person_experience', 'enrichment', 'affiliation_stub']
+      - name: industry_id
+        description: FK to ref.industry. NULL only when PDL emits no company.industry (or enrichment.industry). ref.industry sources from pdl_person_parsed.industry, but PDL uses a single canonical industry taxonomy across every field (person-level, experience-level and enrichment values share one vocabulary), so no widening is needed.
+        data_tests:
+          - relationships:
+              to: ref('industry')
+              field: id
+      - name: industry_v2_id
+        description: FK to ref.industry_v2 (PDL-only). NULL when PDL emits no company.industry_v2.
+        data_tests:
+          - relationships:
+              to: ref('industry_v2')
+              field: id
+      - name: location_id
+        description: FK to ref.location. NULL when the company's HQ has no PDL country.
+        data_tests:
+          - relationships:
+              to: ref('location')
+              field: id
+      # V24 inlined address scalars onto integration.company; the
+      # company.address_id FK and integration.company_hq_address table
+      # were dropped. Address columns now live directly on this table —
+      # latitude, longitude, postal_code, street_address, address_line_2.
+      # No relationships tests needed on those (they're scalar columns,
+      # not FKs).
+
+  - name: company_affiliation
+    description: |
+      Company hierarchy + parent/subsidiary junction (V28). One row per
+      staging.pdl_api_company_parsed.affiliated_entities[] element. Both
+      company FKs point at integration.company (directional names:
+      subject = who asserted the affiliation, affiliated = the other side);
+      INNER JOINs always resolve under the stub-insert pattern (docs/data_model/08
+      §6.4). status_id / catalyst_id are reserved nullable for the future
+      Parent Subsidiary Details extension (docs/data_model/08 §4.4). See docs/design/18_pdl_api_generic_caller.md.
+    columns:
+      - name: subject_company_id
+        description: FK to integration.company.id — the company whose enrichment response carried this affiliation.
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('company')
+              field: id
+      - name: affiliated_company_id
+        description: FK to integration.company.id — the other side. Always resolves via the stub-insert pattern.
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('company')
+              field: id
+      - name: relationship_id
+        description: FK to ref.pdl_relationship.id. Loader-discovered from the same affiliated_entities[] source, so always resolves.
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('pdl_relationship')
+              field: id
+
+  - name: experience
+    description: |
+      Conformed Experience (PDL). Junction with attributes —
+      person × company × role with title, dates, summary. 1:1 with
+      staging.pdl_person_experience_unique (itself deduped by the 4-col
+      natural key), minus rows whose person doesn't resolve.
+
+      V25: 3 individual FKs to ref.job_title_class / job_title_role /
+      job_title_subrole replace the V6 composite FK
+      job_title_classification_id. Preserves partial PDL classifications
+      (class+role with NULL sub_role) that the composite FK couldn't
+      represent. Each FK is nullable independently.
+
+      V25 also: start_date/end_date timestamptz → start_year/end_year
+      int4 (year-only matches PDL source precision).
+    columns:
+      - name: id
+        description: Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY person_pdl_id, company_pdl_id, start_year, title_name) — matches V19 dedup covering index. Not stable across rebuilds.
+        data_tests:
+          - not_null
+          - unique
+      - name: person_id
+        description: FK to integration.person. NOT NULL by DDL — INNER JOIN to integration.person on pdl_id; experiences whose person_pdl_id isn't in integration.person are dropped (rare; raw ids that PDL later merged into another id).
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: experience_idx
+        description: PDL array position within $.experience[*], carried from staging. (person_id, experience_idx) is unique per row and indexed (idx_experience_person_idx) — used as the JOIN key from per-experience junction models (experience_location/_industry/_seniority_level). Added V27.
+        data_tests:
+          - not_null
+      - name: company_id
+        description: FK to integration.company. NULL when PDL emitted the experience without a company.id.
+        data_tests:
+          - relationships:
+              to: ref('company')
+              field: id
+      - name: title_class_id
+        description: FK to ref.job_title_class. Independently nullable (V25).
+        data_tests:
+          - relationships:
+              to: ref('job_title_class')
+              field: id
+      - name: title_role_id
+        description: FK to ref.job_title_role. Independently nullable.
+        data_tests:
+          - relationships:
+              to: ref('job_title_role')
+              field: id
+      - name: title_sub_role_id
+        description: FK to ref.job_title_subrole. Independently nullable; the most frequently NULL classification dimension.
+        data_tests:
+          - relationships:
+              to: ref('job_title_subrole')
+              field: id
+
+  - name: school
+    description: |
+      Conformed School (PDL). One row per PDL school_pdl_id.
+      Sourced from pdl_person_schools_unique + pdl_person_education_unique
+      (for school location resolution via the 4-way ref chain).
+      Address: coarse-grain only (continent/country/region/locality —
+      no street, no metro at PDL school grain per docs/data_model/13 §4.4).
+    columns:
+      - name: id
+        description: Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY pdl_id). Not stable across rebuilds.
+        data_tests:
+          - not_null
+          - unique
+      - name: pdl_id
+        description: PDL natural key for the school (school_pdl_id at staging).
+        data_tests:
+          - not_null
+          - unique
+      - name: location_id
+        description: FK to ref.location. NULL when PDL emitted no country for the school OR the (country, region, locality, NULL) tuple isn't in ref.location.
+        data_tests:
+          - relationships:
+              to: ref('location')
+              field: id
+
+  - name: person_education
+    description: |
+      Conformed Person × School junction with attributes (PDL).
+      1:1 with staging.pdl_person_education_unique, minus rows whose person
+      doesn't resolve.
+      V26 switched start_date/end_date timestamptz → start_year/end_year
+      int4 (mirrors V25 experience pivot — PDL year-only precision).
+    columns:
+      - name: id
+        description: Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY person_pdl_id, school_pdl_id, start_year, degrees_text) — matches the staging unique constraint. Not stable across rebuilds.
+        data_tests:
+          - not_null
+          - unique
+      - name: person_id
+        description: FK to integration.person. NOT NULL by DDL — INNER JOIN drops education rows whose person_pdl_id isn't in integration.person.
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: school_id
+        description: FK to integration.school. NULL when PDL emitted no school_pdl_id on the education row.
+        data_tests:
+          - relationships:
+              to: ref('school')
+              field: id
+
+  - name: person_country
+    description: |
+      Pure junction (composite PK person_id, country_id) on the
+      multi-valued PDL countries[] array from pdl_person_unique.
+      Distinct from integration.person.location_id (home country only).
+    columns:
+      - name: person_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: country_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('country')
+              field: id
+
+  - name: person_state_province
+    description: |
+      Pure junction (composite PK person_id, state_province_id) on PDL
+      regions[]. Each entry is a 2-part comma-separated tuple
+      ("california, united states") parsed into region + country, then
+      resolved to ref.state_province via (country_id, name_lc).
+    columns:
+      - name: person_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: state_province_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('state_province')
+              field: id
+
+  - name: person_location
+    description: |
+      Pure junction (composite PK person_id, location_id) on PDL
+      location_names[]. Each array entry is a comma-separated string
+      ("Buffalo, New York, United States") parsed right-to-left into
+      country / region / city, then resolved through the 4-way ref
+      chain (metro stays NULL — location_names[] doesn't carry metro).
+    columns:
+      - name: person_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: location_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('location')
+              field: id
+
+  - name: person_skill
+    description: |
+      Pure junction (composite PK person_id, skill_id) on PDL skills[]
+      from pdl_person_unique. Matches by ref.skill.name (bare PDL string).
+    columns:
+      - name: person_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: skill_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('skill')
+              field: id
+
+  - name: person_interest
+    description: |
+      Pure junction (composite PK person_id, interest_id) on PDL
+      interests[] from pdl_person_unique. Matches by ref.interest.name.
+    columns:
+      - name: person_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('person')
+              field: id
+      - name: interest_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('interest')
+              field: id
+
+  - name: person_language
+    description: |
+      Pure junction (composite PK person_id, language_id). Empty
+      stub today — PDL doesn't deliver languages on the current
+      subscription tier; no `languages` column on staging. Table
+      exists; populated when a real source arrives.
+    columns:
+      - name: person_id
+        data_tests:
+          - relationships:
+              to: ref('person')
+              field: id
+      # No relationships test on language_id — there's no ref/language.sql
+      # dbt model (ref.language is a Flyway-created table with no current
+      # source). Re-add when language data starts populating.
+      - name: language_id
+
+  - name: experience_location
+    description: |
+      Pure junction (composite PK experience_id, location_id) on the
+      experience's company HQ address. Sources from
+      pdl_person_addresses_unique (source_context='experience_company_hq'),
+      joined back to integration.experience on (person_id, experience_idx)
+      (V27).
+    columns:
+      - name: experience_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('experience')
+              field: id
+      - name: location_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('location')
+              field: id
+
+  - name: experience_industry
+    description: |
+      Pure junction (composite PK experience_id, industry_id) with
+      per-edge `source` text column recording which source attested the
+      edge. source='pdl' hardcoded;
+      industry sourced from pdl_person_experience_unique.company_industry.
+    columns:
+      - name: experience_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('experience')
+              field: id
+      - name: industry_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('industry')
+              field: id
+      - name: source
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ['pdl']
+
+  - name: experience_seniority_level
+    description: |
+      Pure junction (composite PK experience_id, seniority_level_id)
+      on pdl_person_experience_unique.title_levels[] — a title can
+      map to multiple levels.
+    columns:
+      - name: experience_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('experience')
+              field: id
+      - name: seniority_level_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('seniority_level')
+              field: id

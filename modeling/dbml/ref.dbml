@@ -1,0 +1,261 @@
+// =============================================================================
+// ref.dbml — canonical reference tables (place, industry, job title,
+// seniority, personal attributes, PDL company relationships)
+//
+// Source of truth for the ref schema. Authored by hand; do NOT edit
+// generated downstream artifacts (Flyway migrations, dbt schema.yml).
+//
+// Spec references:
+//   - docs/data_model/10_reference_tables.md — overall ref pattern + seeding lifecycle
+//   - docs/data_model/12_location.md         — place hierarchy
+//   - docs/data_model/13_person.md §5        — person-attribute tables
+//
+// Population:
+//   - Place, industry, job-title, seniority, personal attributes — loader-populated from PDL.
+//
+// Rebuild policy: ref.* rebuilds on every run from raw + (future) seed
+// migrations. Surrogate IDs are NOT stable across rebuilds. See doc 10,
+// "Rebuild policy".
+//
+// Surrogate id generation: dbt-computed (ROW_NUMBER OVER natural-key
+// ORDER BY) in each ref model SELECT. NOT a Postgres IDENTITY column.
+// This pattern lets the project keep on_schema_change='fail' as the
+// universal drift detector without per-table overrides — every ref
+// model SELECT produces the full target column shape (id +
+// timestamp_created + timestamp_modified inclusive). V14 dropped the
+// original IDENTITY clause from V4's ref-baseline tables. See ADR-0008.
+//
+// DBML caveats (handled by hand-authored sidecar migrations):
+//   - COALESCE(...)-based UNIQUE constraints on ref.city and ref.location
+//     cannot be expressed in DBML. Hand-authored migration creates them
+//     with the NULL-coalescing semantics. See doc 12 §4.4, §4.6.
+// =============================================================================
+
+Project pdl_etl_ref {
+  database_type: 'PostgreSQL'
+  Note: 'PDL ETL — ref schema. Canonical reference tables; loader-populated.'
+}
+
+// -----------------------------------------------------------------------------
+// Place hierarchy (doc 12)
+// -----------------------------------------------------------------------------
+
+Table ref.continent {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name_lc             text        [unique, not null, note: 'PDL canonical (lowercase English): "north america", "europe", etc.']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'Continents. Loader-populated from PDL location.continent strings; ~7 rows. Future seed migration possible but unnecessary.'
+}
+
+Table ref.country {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name_lc             text        [unique, not null, note: 'PDL canonical lowercase English ("united states"). Join key from PDL data.']
+  continent_id        bigint      [ref: > ref.continent.id, note: 'Advisory; populated by future seed migration. Currently NULL.']
+  iso_alpha_2         text        [note: 'Advisory ISO 3166-1 alpha-2; future seed']
+  iso_alpha_3         text        [note: 'Advisory ISO 3166-1 alpha-3; future seed']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'Country dimension. Loader-populated; an ISO seed migration is future work.'
+}
+
+Table ref.state_province {
+  id                     bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  country_id             bigint      [not null, ref: > ref.country.id]
+  name_lc                text        [not null, note: 'PDL canonical region string, lowercased ("california").']
+  iso_subdivision_code   text        [note: 'Advisory ISO 3166-2 ("US-CA"); future seed']
+  timestamp_created      timestamptz [not null, default: `now()`]
+  timestamp_modified     timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (country_id, name_lc) [unique, name: 'state_province_country_id_name_lc_uk']
+    country_id            [name: 'idx_state_province_country_id']
+  }
+
+  Note: 'State / province / top-level subdivision (ISO 3166-2 scope). Loader-populated; an ISO 3166-2 seed migration is future work.'
+}
+
+Table ref.city {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  country_id          bigint      [not null, ref: > ref.country.id]
+  state_province_id   bigint      [ref: > ref.state_province.id, note: 'NULL when PDL emits city without region.']
+  name_lc             text        [not null, note: 'PDL canonical city string, lowercased ("san francisco").']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    country_id        [name: 'idx_city_country_id']
+    state_province_id [name: 'idx_city_state_province_id']
+  }
+
+  Note: 'City. Loader-populated only (no practical seed source). UNIQUE on (country_id, COALESCE(state_province_id, 0), name_lc) — NULL-coalescing UNIQUE is created by a hand-authored sidecar migration (DBML cannot express COALESCE in indexes). The widest place dimension at PDL scale.'
+}
+
+Table ref.metro {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  country_id          bigint      [not null, ref: > ref.country.id]
+  name_lc             text        [not null, note: 'PDL canonical metro string ("san francisco bay area").']
+  msa_code            text        [note: 'Advisory US Census MSA code; future seed (US only).']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (country_id, name_lc) [unique, name: 'metro_country_id_name_lc_uk']
+    country_id            [name: 'idx_metro_country_id']
+  }
+
+  Note: 'Metro area. PDL canon as join key; Census MSA codes added advisorially by future seed migration. Doc 12 §4.5.'
+}
+
+Table ref.location {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  country_id          bigint      [not null, ref: > ref.country.id]
+  state_province_id   bigint      [ref: > ref.state_province.id]
+  city_id             bigint      [ref: > ref.city.id]
+  metro_id            bigint      [ref: > ref.metro.id]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    country_id        [name: 'idx_location_country_id']
+    state_province_id [name: 'idx_location_state_province_id']
+    city_id           [name: 'idx_location_city_id']
+    metro_id          [name: 'idx_location_metro_id']
+  }
+
+  Note: 'Composite-FK grain row — one per distinct (country, state_province, city, metro) tuple PDL emits. UNIQUE on (country_id, COALESCE(state_province_id, 0), COALESCE(city_id, 0), COALESCE(metro_id, 0)) — created by hand-authored sidecar migration. Doc 12 §4.6.'
+}
+
+// -----------------------------------------------------------------------------
+// Industry classifications (doc 13 §5.1)
+// -----------------------------------------------------------------------------
+
+Table ref.industry {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null, note: 'PDL canonical industry name.']
+  source_type         text        [not null, note: "'pdl' — provenance tag."]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'Industry dimension. PDL canonical v1 industry enum.'
+}
+
+Table ref.industry_v2 {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null, note: 'PDL canonical industry v2 (expanded enum).']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'Industry v2 — PDL expanded canonical industry enum. PDL-sourced only.'
+}
+
+// -----------------------------------------------------------------------------
+// Job-title hierarchy (doc 13 §5.2)
+// -----------------------------------------------------------------------------
+
+Table ref.job_title_class {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null, note: "PDL title.class — 'operations', 'engineering', 'sales', etc."]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL canonical job-title class (top-level category).'
+}
+
+Table ref.job_title_role {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null, note: "PDL title.role — 'software_engineer', 'product_manager', etc."]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL canonical job-title role.'
+}
+
+Table ref.job_title_subrole {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null, note: "PDL title.sub_role — 'backend_engineer', 'data_engineer', etc."]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL canonical job-title sub-role.'
+}
+
+// ref.job_title_classification — DROPPED in V25.
+//
+// V6 baseline created a composite ref table gluing (class, role, sub_role) into
+// a single FK target for integration.experience.job_title_classification_id.
+// V25 replaced that composite FK with 3 individual FKs to ref.job_title_
+// class / job_title_role / job_title_subrole (Option E) — preserves the
+// PDL experiences emitted with class+role but no sub_role, a noticeable
+// share of rows (the composite FK required NOT NULL on all 3 cols, dropping
+// those rows' classification). With no remaining FK referrers, V25 dropped the table +
+// the processing/dbt/models/ref/job_title_classification.sql model.
+//
+// If a future use case demands the composite ref table, recreate via additive
+// migration — but Option E's per-component FKs are likely sufficient for
+// any "show me all engineering managers" query (3-way JOIN to ref tables).
+
+// -----------------------------------------------------------------------------
+// Seniority (doc 13 §5.3)
+// -----------------------------------------------------------------------------
+
+Table ref.seniority_level {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null, note: "PDL title.levels[] — 'manager', 'director', 'cxo', 'senior', 'partner', etc."]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL canonical seniority level. Junctioned via integration.experience_seniority_level (M:N — one experience can map to multiple levels).'
+}
+
+// -----------------------------------------------------------------------------
+// Personal-attribute dimensions (doc 13 §5.4)
+// -----------------------------------------------------------------------------
+
+Table ref.skill {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [not null]
+  type                text        [note: 'PDL skill category, if any.']
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    name [name: 'idx_skill_name']
+  }
+
+  Note: 'PDL skills[]. Junctioned via integration.person_skill. No UNIQUE on name (PDL skill strings are noisy; cross-source dedup is future work).'
+}
+
+Table ref.interest {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text
+  type                text
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL interests[]. Junctioned via integration.person_interest.'
+}
+
+Table ref.language {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER over the natural-key ORDER BY; not stable across rebuilds. See ADR-0008.']
+  name                text        [unique, not null]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL languages[].name. Junctioned via integration.person_language. PDL proficiency (1-5) is dropped; add column when downstream needs it.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL company relationship vocabulary — V28
+// -----------------------------------------------------------------------------
+
+Table ref.pdl_relationship {
+  id                  bigint      [pk, note: 'Surrogate. dbt-computed via ROW_NUMBER OVER (ORDER BY relationship); not stable across rebuilds. See ADR-0008.']
+  relationship        text        [unique, not null, note: "PDL canonical relationship type. Currently 4 observed values from $.affiliated_entities[].relationship: 'direct_subsidiary', 'indirect_subsidiary', 'immediate_parent', 'ultimate_parent'. New values are picked up automatically by the loader on next rebuild."]
+  timestamp_created   timestamptz [not null, default: `now()`]
+  timestamp_modified  timestamptz [not null, default: `now()`]
+
+  Note: 'PDL company relationship type vocabulary. Loader-discovered (NOT seeded) per ADR-0011 — populated by processing/dbt/models/ref/pdl_relationship.sql from staging.pdl_api_company_parsed.affiliated_entities[].relationship. Junctioned via integration.company_affiliation.relationship_id. Future ref.pdl_relationship_status and ref.pdl_relationship_catalyst will be added when PDL emits the Parent Subsidiary Details extension fields (not in our current contract). V28 added the table.'
+}

@@ -1,0 +1,1165 @@
+// =============================================================================
+// staging.dbml — per-source staging tables (parsed → unique → staged)
+//
+// Source of truth for the staging schema. Authored by hand; do NOT edit
+// generated downstream artifacts (Flyway migrations, dbt schema.yml).
+//
+// Spec references:
+//   - docs/design/02_pipeline_design.md §8       — staging layer responsibilities
+//   - docs/data_model/13_person.md §6     — PDL person field inventory
+//
+// Population: dbt models in processing/dbt/models/staging/<source>/ populate
+// these tables via materialized='incremental' + incremental_strategy='append'
+// + pre_hook='TRUNCATE TABLE {{ this }} RESTART IDENTITY CASCADE'. The
+// pattern is full-rebuild semantics under stateless content rebuild
+// (docs/requirements/01 §2): TRUNCATE clears the table, then bulk INSERT from raw.
+//
+// DDL ownership: Flyway. dbt populates pre-existing tables; never DROPs.
+// on_schema_change='fail' in dbt catches drift between this DBML and the
+// dbt model SELECT shape.
+//
+// Naming convention (per docs/design/02 §8): staging.<source>_<entity>_<stage>
+//   - parsed: faithful flatten of raw JSON to typed columns (no dedup, no
+//             ledger reads)
+//   - unique: deduped by natural key + alias resolution via catalog ledger
+//   - staged: PER-SOURCE OPTIONAL. Used when the source has genuine
+//             inactive-filter logic. Skipped when there's nothing to
+//             filter — e.g., PDL skips it entirely (inactive
+//             persons aren't in PDL's data/ snapshot to begin with;
+//             see docs/design/15). Integration models read
+//             from _staged when present, _unique otherwise.
+//
+// Integration boundary (per ADR-0005):
+//   Staging models NEVER populate ref tables. Ref tables (controlled
+//   vocabularies like ref.skill, ref.job_title_class, ref.city) are
+//   populated by dedicated ref dbt models in processing/dbt/models/ref/,
+//   which read from staging and emit DISTINCT vocab into ref via stateless
+//   rebuild. Integration dbt models JOIN to ref for FK resolution.
+//   See docs/decisions/0005-ref-population-layer.md.
+// =============================================================================
+
+Project pdl_etl_staging {
+  database_type: 'PostgreSQL'
+  Note: 'PDL ETL — staging schema. Per-source parsed/unique/staged tables; populated by dbt; DDL Flyway-owned.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — parsed (top-level scalar flatten from raw.pdl_person.payload)
+//
+// One row per raw.pdl_person record (1:1 with raw). All top-level scalars
+// PDL emits, even fields integration drops (job_company_*, job_onet_*,
+// social-network duplicates of profiles[]). Staging is a faithful flatten;
+// integration picks what to keep.
+//
+// NOT in this table:
+//   - Sub-object array unnesting (experience[], education[], plus the
+//     companies / schools / addresses flattens) — separate
+//     pdl_person_*_parsed tables. (profiles[], certifications[] and
+//     languages[] had their own tables until V10/V11 dropped them.)
+//   - Dedup and alias resolution (handled in pdl_person_unique; PDL has no
+//     _staged tier, so there is no inactive filtering at staging).
+//   - PII (birth_date, emails[], phones[], possible_*).
+//
+// Simple text arrays (skills, interests, location_names,
+// countries, regions) DO live in this table as jsonb columns. They have no
+// per-entry sub-object worth typing into columns; dedicated ref dbt models
+// unnest at consume time via jsonb_array_elements_text() and feed the ref
+// tables via DISTINCT rebuild (stateless rebuild; see
+// docs/decisions/0005-ref-population-layer.md).
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_parsed {
+  // Ingester provenance
+  partition_id                              smallint     [note: 'PDL file index within the delivery, from raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz  [note: 'When the ingester loaded the raw row.']
+
+  // Record metadata (PDL person record-level)
+  pdl_id                                    text         [note: 'PDL natural key (not unique on this table; dedup at pdl_person_unique).']
+  first_seen                                timestamptz  [note: 'PDL first_seen — when the record entered PDL.']
+  num_sources                               int4         [note: 'PDL num_sources — count of upstream data sources that contributed to this record.']
+  num_records                               int4         [note: 'PDL num_records — count of underlying source records merged into this PDL record.']
+  dataset_version                           text         [note: 'PDL dataset_version (e.g. "NN.N"). Diagnostic for schema drift across deliveries.']
+  operation_id                              text         [note: 'PDL Data License delivery operation identifier.']
+
+  // Names
+  first_name                                text         [note: 'PDL first_name.']
+  middle_name                               text         [note: 'PDL middle_name.']
+  middle_initial                            text         [note: 'Single-character middle initial. PDL emits separately from middle_name; either or both may be populated.']
+  last_name                                 text         [note: 'PDL last_name.']
+  last_initial                              text         [note: 'Single-character last initial.']
+  full_name                                 text         [note: 'PDL-concatenated full name.']
+
+  // Bio
+  headline                                  text         [note: 'PDL headline — short professional tagline.']
+  summary                                   text         [note: 'PDL summary — long-form bio prose.']
+  industry                                  text         [note: 'PDL canonical person-level industry (v1 taxonomy). Reflects the person\'s current-job industry, not a historical aggregate.']
+  sex                                       text         [note: 'PDL sex — single-character. PII-sensitive; docs/data_model/13 §6.1 governs retention.']
+
+  // Inferred (PDL-derived)
+  inferred_years_experience                 int4         [note: 'PDL-derived years of professional experience. Inferred, not authoritative.']
+  inferred_salary                           text         [note: 'PDL-derived salary band (text — e.g. "100,000-150,000"; not numeric). Inferred, not authoritative.']
+
+  // Contact (PII-allowed subset; emails[]/phones[] excluded per docs/data_model/13 §6.1;
+  // mobile_phone dropped in V16 — confirmed PDL bool-placeholder)
+  work_email                                text         [note: 'Work email address. PII-allowed per docs/data_model/13 §6.1.']
+
+  // Current job (flat — duplicate of experience[is_primary]; kept for
+  // faithful flatten; integration deduplicates)
+  job_title                                 text         [note: 'PDL job_title — current-role title string. Flat duplicate of $.experience[is_primary].title.name; the canonical home for current-job data is pdl_person_experience_unique (is_primary=true).']
+  job_title_role                            text         [note: 'PDL job_title_role — canonical role enum for the current job. Duplicate of $.experience[is_primary].title.role.']
+  job_title_sub_role                        text         [note: 'PDL job_title_sub_role — canonical sub-role enum for the current job. Duplicate of $.experience[is_primary].title.sub_role.']
+  job_title_class                           text         [note: 'PDL job_title_class — canonical class enum for the current job. Duplicate of $.experience[is_primary].title.class.']
+  job_start_year                            int4         [note: 'Year extracted from PDL job_start_date (sent as "yyyy", "yyyy-mm", or "yyyy-mm-dd"). Day/month dropped by design (year-only across the board). Nullable.']
+  job_last_changed                          date         [note: 'System timestamp from PDL — full date, no extraction needed.']
+  job_last_verified                         date         [note: 'System timestamp from PDL — full date, no extraction needed.']
+  job_summary                               text         [note: 'PDL job_summary — free-text description of the current role. Duplicate of $.experience[is_primary].summary.']
+
+  // O*NET federal occupational codes (kept for faithful flatten;
+  // integration may drop)
+  job_onet_code                             text         [note: 'PDL job_onet_code — O*NET-SOC occupational code for the current job (US federal occupational taxonomy).']
+  job_onet_major_group                      text         [note: 'PDL job_onet_major_group — top level of the O*NET-SOC hierarchy for the current job.']
+  job_onet_minor_group                      text         [note: 'PDL job_onet_minor_group — second level of the O*NET-SOC hierarchy.']
+  job_onet_broad_occupation                 text         [note: 'PDL job_onet_broad_occupation — third level of the O*NET-SOC hierarchy.']
+  job_onet_specific_occupation              text         [note: 'PDL job_onet_specific_occupation — fourth level of the O*NET-SOC hierarchy.']
+  job_onet_specific_occupation_detail       text         [note: 'PDL job_onet_specific_occupation_detail — most granular level of the O*NET-SOC hierarchy.']
+
+  // Current company (flat — duplicate of experience[is_primary].company)
+  job_company_name                          text         [note: 'Current employer name. Flat duplicate of $.experience[is_primary].company.name.']
+  job_company_id                            text         [note: 'Current employer PDL company id. Duplicate of $.experience[is_primary].company.id.']
+  job_company_website                       text         [note: 'Current employer primary website URL.']
+  job_company_industry                      text         [note: 'Current employer canonical industry (v1). Duplicate of the is_primary experience company.']
+  job_company_industry_v2                   text         [note: 'Current employer canonical industry (v2 taxonomy).']
+  job_company_size                          text         [note: 'Current employer employee-count band ("1-10" … "10001+"); free-text canonical, not numeric.']
+  job_company_type                          text         [note: '"public" | "private" | "educational" | "non_profit" | "government" for the current employer.']
+  job_company_founded                       int4         [note: 'Current employer founding year (4-digit).']
+  job_company_employee_count                int4         [note: 'Current employer headcount integer (point estimate; distinct from the size band).']
+  job_company_inferred_revenue              text         [note: 'PDL-inferred revenue band for the current employer (text band, not numeric). Inferred, not authoritative.']
+  job_company_total_funding_raised          int8         [note: 'Total funding raised by the current employer (int8, currency units per PDL).']
+  job_company_ticker                        text         [note: 'Current employer stock ticker. Populated only when job_company_type=public.']
+  job_company_linkedin_url                  text         [note: 'Public LinkedIn URL for the current employer.']
+  job_company_linkedin_id                   text         [note: 'PDL-internal LinkedIn company id (numeric string) for the current employer.']
+  job_company_facebook_url                  text         [note: 'Public Facebook URL for the current employer.']
+  job_company_twitter_url                   text         [note: 'Public Twitter / X URL for the current employer.']
+  job_company_12mo_employee_growth_rate     "numeric(7,4)"         [note: 'PDL-computed trailing-12-month employee growth rate for the current employer (ratio).']
+
+  // Current company location (flat)
+  job_company_location_name                 text         [note: 'PDL job_company_location_name — display string. Denormalized; derivable from the ref.location hierarchy. Flat duplicate of $.experience[is_primary].company.location.name. Doc 12 §5.']
+  job_company_location_street_address       text         [note: 'PDL job_company_location_street_address. Flat duplicate of $.experience[is_primary].company.location.street_address. Doc 12 §5.']
+  job_company_location_address_line_2       text         [note: 'PDL job_company_location_address_line_2. Flat duplicate of $.experience[is_primary].company.location.address_line_2. Doc 12 §5.']
+  job_company_location_locality             text         [note: 'PDL job_company_location_locality (city). Resolves to ref.city via (country_id, state_province_id, name_lc). Flat duplicate of $.experience[is_primary].company.location.locality. Doc 12 §5.']
+  job_company_location_region               text         [note: 'PDL job_company_location_region (state / province). Resolves to ref.state_province via (country_id, name_lc). Flat duplicate of $.experience[is_primary].company.location.region. Doc 12 §5.']
+  job_company_location_country              text         [note: 'PDL job_company_location_country. Resolves to ref.country via name_lc upsert. Flat duplicate of $.experience[is_primary].company.location.country. Doc 12 §5.']
+  job_company_location_continent            text         [note: 'PDL job_company_location_continent. Resolves to ref.continent; advisory metadata on ref.country.continent_id. Flat duplicate of $.experience[is_primary].company.location.continent. Doc 12 §5.']
+  job_company_location_metro                text         [note: 'PDL job_company_location_metro. Resolves to ref.metro via (country_id, name_lc). Flat duplicate of $.experience[is_primary].company.location.metro. Doc 12 §5.']
+  job_company_location_postal_code          text         [note: 'PDL job_company_location_postal_code. Flat duplicate of $.experience[is_primary].company.location.postal_code. Doc 12 §5.']
+  job_company_location_geo                  text         [note: 'PDL job_company_location_geo — "lat,lng" string. Parsed to numeric latitude / longitude at consume time. Flat duplicate of $.experience[is_primary].company.location.geo. Doc 12 §5.']
+
+  // Social — LinkedIn at top level (canonical primary per docs/data_model/13)
+  linkedin_id                               text         [note: 'PDL-internal LinkedIn person id (numeric string). Cross-source join key per docs/requirements/01 §4.']
+  linkedin_url                              text         [note: 'Public LinkedIn URL. Cross-source join key per docs/requirements/01 §4.']
+  linkedin_username                         text         [note: 'LinkedIn vanity-URL username slug.']
+  linkedin_connections                      int4         [note: 'PDL linkedin_connections — connection-count integer.']
+
+  // Social — facebook/twitter/github URL+id+username dropped in V16
+  // (all bool-placeholders in the PDL field bundle this pipeline receives).
+  // facebook_friends is the always-NULL int4 companion of facebook_url;
+  // kept in staging (not in the V16 drop list).
+  facebook_friends                          int4         [note: 'PDL facebook_friends — friend-count integer. Always NULL in the PDL field bundle this pipeline receives (paired with the facebook_url bool-placeholder dropped in V16). Companion column retained for now.']
+
+  // Person home location (flat). location_street_address + location_address_line_2
+  // were bool-placeholders on person-home grain — dropped in V16.
+  location_name                             text         [note: 'PDL location.name — current-home display-name string (person-home grain). Same address also surfaced in pdl_person_addresses_parsed with source_context=person_home.']
+  location_locality                         text         [note: 'PDL location.locality — current-home city.']
+  location_region                           text         [note: 'PDL location.region — current-home state / province.']
+  location_country                          text         [note: 'PDL location.country — current-home country.']
+  location_continent                        text         [note: 'PDL location.continent — current-home continent.']
+  location_metro                            text         [note: 'PDL location.metro — current-home metro area.']
+  location_postal_code                      text         [note: 'PDL location.postal_code — current-home postal code.']
+  location_geo                              text         [note: 'PDL location.geo — current-home "lat,lng" string.']
+  location_last_updated                     date         [note: 'PDL location_last_updated — date the person\'s home location was last refreshed upstream.']
+
+  // Simple text arrays kept as jsonb (no per-entry sub-object). Integration
+  // loaders unnest via jsonb_array_elements_text() to populate ref tables
+  // and junction tables. Dedup at the ref upsert layer (ON CONFLICT DO
+  // NOTHING) — no staging _unique needed.
+  // name_aliases dropped in V16 (never populated).
+  skills                                    jsonb        [note: 'PDL skills[] — feeds ref.skill.']
+  interests                                 jsonb        [note: 'PDL interests[] — feeds ref.interest.']
+  location_names                            jsonb        [note: 'PDL location_names[] — additional location strings; feeds ref.location.']
+  countries                                 jsonb        [note: 'PDL countries[] — feeds ref.country.']
+  regions                                   jsonb        [note: 'PDL regions[] — feeds ref.state_province.']
+
+  Indexes {
+    pdl_id         [name: 'idx_pdl_person_parsed_pdl_id']
+    partition_id   [name: 'idx_pdl_person_parsed_partition_id']
+  }
+
+  Note: 'PDL person top-level scalar flatten — one row per raw.pdl_person record. No PK (multiple rows per pdl_id allowed across deliveries; dedup at pdl_person_unique). Simple text arrays (skills, interests, location_names, countries, regions) live here as jsonb. Populated by processing/dbt/models/staging/pdl_person/pdl_person_parsed.sql via JSON_TABLE. V16 dropped 11 cols (10 PDL bool-placeholders + name_aliases, which was never populated).'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — experience array (one row per experience entry per person)
+//
+// Demonstrates the JSON_TABLE NESTED PATH pattern for unnesting PDL arrays.
+// Same approach applies to education[] (its own _parsed table below; the
+// profiles[] / certifications[] / languages[] tables were dropped in
+// V10/V11). Simple text arrays
+// (skills[], interests[], location_names[], countries[],
+// regions[]) skip the _parsed table and live as jsonb on pdl_person_parsed
+// — no per-entry sub-object to type.
+//
+// Grain: one row per (raw.pdl_person record × experience array entry).
+// experience_idx via FOR ORDINALITY preserves PDL's array order within
+// each person.
+//
+// Multi-valued sub-fields within an experience (title.levels[],
+// location_names[], raw[]) are kept as jsonb here — unnesting them would
+// multiply rows and they're rarely queried by themselves. integration.* can
+// project them into junction tables (e.g., experience_seniority_level from
+// title.levels) by reading the jsonb column.
+//
+// No PK — multiple snapshots of the same (person_pdl_id, experience_idx)
+// land here; dedup happens at pdl_person_experience_unique.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_experience_parsed {
+  // Ingester provenance
+  partition_id                              smallint     [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz         [note: 'Ingester provenance — when the ingester loaded the raw row.']
+
+  // Person link
+  person_pdl_id                             text         [note: 'PDL person id (parent record) — join key to pdl_person_parsed.']
+  experience_idx                            int4         [note: 'FOR ORDINALITY — 1-based array position within $.experience[*].']
+
+  // Per-experience scalars
+  start_year                                int4         [note: 'Year extracted from PDL experience[].start_date (which is sent as "yyyy", "yyyy-mm", or "yyyy-mm-dd"). Day/month dropped by design (year-only across the board). Nullable: PDL frequently omits the date entirely.']
+  end_year                                  int4         [note: 'Year extracted from PDL experience[].end_date. NULL = current position OR PDL did not send a date. Same extraction rule as start_year.']
+  is_primary                                bool         [note: 'PDL experience[].is_primary — true for the current role.']
+  summary                                   text         [note: 'PDL experience[].summary — free-text description of the role.']
+  first_seen                                timestamptz  [note: 'PDL experience[].first_seen — provenance metadata.']
+  last_seen                                 timestamptz  [note: 'PDL experience[].last_seen — provenance metadata.']
+  num_sources                               int4         [note: 'PDL experience[].num_sources — provenance metadata.']
+
+  // Title
+  title_name                                text         [note: 'PDL experience[].title.name (raw title string).']
+  title_role                                text         [note: 'PDL experience[].title.role (canonical role enum).']
+  title_sub_role                            text         [note: 'PDL experience[].title.sub_role (canonical sub-role enum).']
+  title_class                               text         [note: 'PDL experience[].title.class (canonical class enum).']
+  title_levels                              jsonb        [note: 'PDL experience[].title.levels[] as jsonb. Projected to ref.seniority_level.']
+  title_raw                                 jsonb        [note: 'PDL experience[].title.raw — array of raw title variants the person entered.']
+
+  // Company sub-object
+  company_pdl_id                            text         [note: 'PDL experience[].company.id — PDL company natural key for this experience row.']
+  company_name                              text         [note: 'PDL experience[].company.name. NULL when PDL did not link the experience to a tracked company.']
+  company_size                              text         [note: 'PDL canonical employee-count band ("1-10", "11-50", "51-200", …, "10001+"). Free-text canonical, not numeric — keep as text.']
+  company_type                              text         [note: '"public" | "private" | "educational" | "non_profit" | "government"']
+  company_founded                           int4         [note: 'Founding year (4-digit).']
+  company_industry                          text         [note: 'PDL canonical industry v1.']
+  company_industry_v2                       text         [note: 'PDL canonical industry v2 (newer taxonomy; both versions kept verbatim).']
+  company_ticker                            text         [note: 'Stock ticker. Populated only if company_type=public.']
+  company_website                           text         [note: 'Primary website URL.']
+  company_linkedin_url                      text         [note: 'Public LinkedIn URL for the company.']
+  company_linkedin_id                       text         [note: 'PDL-internal LinkedIn company id (numeric string).']
+  company_facebook_url                      text         [note: 'Public Facebook URL.']
+  company_twitter_url                       text         [note: 'Public Twitter / X URL.']
+
+  // Company location (per-experience.company.location)
+  company_location_name                     text         [note: 'PDL experience[].company.location.name — display string. Denormalized; derivable from the ref.location hierarchy. Doc 12 §5.']
+  company_location_street_address           text         [note: 'PDL experience[].company.location.street_address. Doc 12 §5.']
+  company_location_address_line_2           text         [note: 'PDL experience[].company.location.address_line_2. Doc 12 §5.']
+  company_location_locality                 text         [note: 'PDL experience[].company.location.locality (city). Resolves to ref.city via (country_id, state_province_id, name_lc). Doc 12 §5.']
+  company_location_region                   text         [note: 'PDL experience[].company.location.region (state / province). Resolves to ref.state_province via (country_id, name_lc). Doc 12 §5.']
+  company_location_country                  text         [note: 'PDL experience[].company.location.country. Resolves to ref.country via name_lc upsert. Doc 12 §5.']
+  company_location_continent                text         [note: 'PDL experience[].company.location.continent. Resolves to ref.continent; advisory metadata on ref.country.continent_id. Doc 12 §5.']
+  company_location_metro                    text         [note: 'PDL experience[].company.location.metro. Resolves to ref.metro via (country_id, name_lc). Doc 12 §5.']
+  company_location_postal_code              text         [note: 'PDL experience[].company.location.postal_code. Doc 12 §5.']
+  company_location_geo                      text         [note: 'PDL experience[].company.location.geo — "lat,lng" string. Parsed to numeric latitude / longitude at consume time. Doc 12 §5.']
+
+  // Multi-valued per-experience attributes (kept as jsonb; not unnested
+  // here to avoid row multiplication)
+  location_names                            jsonb        [note: 'PDL experience[].location_names[] — work locations as jsonb array.']
+  raw_names                                 jsonb        [note: 'PDL experience[].raw[] — array of free-text employer names the person typed.']
+
+  Indexes {
+    person_pdl_id                            [name: 'idx_pdl_person_experience_parsed_person_pdl_id']
+    company_pdl_id                           [name: 'idx_pdl_person_experience_parsed_company_pdl_id']
+    partition_id                             [name: 'idx_pdl_person_experience_parsed_partition_id']
+    (person_pdl_id, company_pdl_id, start_year, title_name, loaded_at, partition_id) [name: 'idx_pdl_person_experience_parsed_dedup']
+  }
+
+  Note: 'PDL experience[] unnested via JSON_TABLE NESTED PATH. One row per (raw.pdl_person record × experience entry). Multi-valued sub-fields (title.levels, location_names, raw) kept as jsonb — integration projects them to junctions. No PK; dedup at pdl_person_experience_unique. Populated by processing/dbt/models/staging/pdl_person/pdl_person_experience_parsed.sql. The _dedup covering index mirrors the DISTINCT ON + ORDER BY of pdl_person_experience_unique (Flyway V19); actual DDL uses `loaded_at DESC, partition_id DESC` ordering DBML cannot express here — see V19 for canonical shape.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — education array (one row per education entry per person)
+//
+// degrees/majors/minors/raw_names kept as jsonb (multi-valued; integration
+// unnests at consume time). School sub-object flattened to school_* scalars
+// + a coarse-grain school location (continent / country / region / locality
+// only — PDL does not emit street-level for schools, per docs/data_model/13 §4.4).
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_education_parsed {
+  // Ingester provenance
+  partition_id                              smallint         [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz         [note: 'Ingester provenance — when the ingester loaded the raw row.']
+
+  // Person link
+  person_pdl_id                             text         [note: 'PDL person id (parent record).']
+  education_idx                             int4         [note: 'FOR ORDINALITY — 1-based array position within $.education[*].']
+
+  // Per-education scalars
+  start_year                                int4         [note: 'Year extracted from PDL education[].start_date (which is sent as "yyyy", "yyyy-mm", or "yyyy-mm-dd"). Day/month dropped by design — PDL rarely sends them and nothing downstream uses them. Nullable: PDL frequently omits the date entirely.']
+  end_year                                  int4         [note: 'Year extracted from PDL education[].end_date. Same rule as start_year.']
+  gpa                                       "numeric(4,2)"         [note: 'PDL education[].gpa (numeric(4,2)).']
+  summary                                   text         [note: 'PDL education[].summary — free-text description.']
+
+  // Multi-valued per-education attributes (kept as jsonb)
+  degrees                                   jsonb        [note: 'PDL education[].degrees — array of degree-name strings.']
+  majors                                    jsonb        [note: 'PDL education[].majors — array of major-name strings.']
+  minors                                    jsonb        [note: 'PDL education[].minors — array of minor-name strings.']
+  raw_names                                 jsonb        [note: 'PDL education[].raw — array of free-text school-name variants.']
+
+  // School sub-object (scalars)
+  school_pdl_id                             text         [note: 'PDL education[].school.id — PDL school natural key for this education row.']
+  school_name                               text         [note: 'PDL education[].school.name.']
+  school_type                               text         [note: '"university" | "secondary school" | etc.']
+  school_domain                             text         [note: 'Primary domain name (e.g. "example.edu"). Useful join key against email-extracted domains.']
+  school_website                            text         [note: 'Primary school website URL.']
+  school_linkedin_url                       text         [note: 'Public LinkedIn URL for the school.']
+  school_linkedin_id                        text         [note: 'PDL-internal LinkedIn school id (numeric string).']
+  school_facebook_url                       text         [note: 'Public Facebook URL.']
+  school_twitter_url                        text         [note: 'Public Twitter / X URL.']
+
+  // School location (coarse-grain only — no street/metro/postal/geo)
+  school_location_continent                 text         [note: 'PDL education[].school.location.continent. Resolves to ref.continent. Doc 12 §5. School location is coarse-grain (no street / metro).']
+  school_location_country                   text         [note: 'PDL education[].school.location.country. Resolves to ref.country via name_lc upsert. Doc 12 §5.']
+  school_location_region                    text         [note: 'PDL education[].school.location.region (state / province). Resolves to ref.state_province via (country_id, name_lc). Doc 12 §5.']
+  school_location_locality                  text         [note: 'PDL education[].school.location.locality (city). Resolves to ref.city via (country_id, state_province_id, name_lc). Doc 12 §5.']
+
+  Indexes {
+    person_pdl_id  [name: 'idx_pdl_person_education_parsed_person_pdl_id']
+    school_pdl_id  [name: 'idx_pdl_person_education_parsed_school_pdl_id']
+    partition_id   [name: 'idx_pdl_person_education_parsed_partition_id']
+  }
+
+  Note: 'PDL education[] unnested via JSON_TABLE NESTED PATH. One row per (raw.pdl_person record × education entry). degrees/majors/minors/raw kept as jsonb. School location is coarse-grain only (PDL does not emit street-level for schools). No PK; dedup at pdl_person_education_unique. The dedup-covering index idx_pdl_person_education_parsed_dedup on (person_pdl_id, school_pdl_id, start_year, (degrees::text), loaded_at DESC, partition_id DESC) is created in Flyway V19 — not in DBML because DBML cannot express the functional `degrees::text` column or DESC ordering. See V19 for the canonical DDL.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — companies (flatten of $.experience[*].company sub-object)
+//
+// One row per (raw.pdl_person record × experience entry). Captures the
+// company sub-object that experience entries embed. Same person can have
+// multiple rows (one per experience); same company can appear across many
+// persons. Dedup to one row per company at pdl_person_companies_unique.
+//
+// Provenance: person_pdl_id + experience_idx links each row back to the
+// source experience entry.
+//
+// NOT in this table: location data. Company HQ location lives in
+// pdl_person_addresses_parsed with source_context='experience_company_hq'.
+// (Note: location columns currently still also live on
+// pdl_person_experience_parsed too; dropping them is an open cleanup item.)
+//
+// Bool-placeholder verification: nested URL fields on companies — facebook_url,
+// twitter_url, linkedin_url, website — are verified CLEAN at company-grain
+// (no bool-placeholders in a large sample). The PDL bool-placeholder pattern is
+// strictly a top-level-person-field phenomenon; do not re-test at company-grain.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_companies_parsed {
+  // Ingester provenance
+  partition_id                              smallint     [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz  [note: 'When the ingester loaded the parent raw row.']
+
+  // Source-record link (back to experience entry that referenced this company)
+  person_pdl_id                             text         [note: 'PDL person id (parent record).']
+  experience_idx                            int4         [note: 'Which experience entry referenced this company. 1-based array index from FOR ORDINALITY.']
+
+  // Company sub-object scalars
+  company_pdl_id                            text         [note: 'PDL experience[].company.id — natural key, deduped at pdl_person_companies_unique.']
+  company_name                              text         [note: 'PDL experience[].company.name. NULL when PDL did not link the experience to a tracked company.']
+  company_size                              text         [note: 'PDL canonical employee-count band ("1-10", "11-50", "51-200", …, "10001+"). Free-text canonical, not numeric — keep as text.']
+  company_type                              text         [note: '"public" | "private" | "educational" | "non_profit" | "government"']
+  company_founded                           int4         [note: 'Founding year (4-digit).']
+  company_industry                          text         [note: 'PDL canonical industry v1.']
+  company_industry_v2                       text         [note: 'PDL canonical industry v2 (newer taxonomy; both versions kept verbatim).']
+  company_ticker                            text         [note: 'Stock ticker. Populated only if company_type=public.']
+  company_website                           text         [note: 'Primary website URL.']
+  company_linkedin_url                      text         [note: 'Public LinkedIn URL for the company.']
+  company_linkedin_id                       text         [note: 'PDL-internal LinkedIn company id (numeric string).']
+  company_facebook_url                      text         [note: 'Public Facebook URL.']
+  company_twitter_url                       text         [note: 'Public Twitter / X URL.']
+
+  Indexes {
+    person_pdl_id   [name: 'idx_pdl_person_companies_parsed_person_pdl_id']
+    company_pdl_id  [name: 'idx_pdl_person_companies_parsed_company_pdl_id']
+    partition_id    [name: 'idx_pdl_person_companies_parsed_partition_id']
+    (company_pdl_id, loaded_at, partition_id) [name: 'idx_pdl_person_companies_parsed_dedup']
+  }
+
+  Note: 'PDL experience[].company flattened. One row per (raw.pdl_person record × experience entry). Source for pdl_person_companies_unique (dedup by company_pdl_id). Company HQ location lives separately in pdl_person_addresses_parsed (source_context = experience_company_hq). The _dedup covering index supports DISTINCT ON dedup in pdl_person_companies_unique; actual Flyway V19 DDL uses DESC ordering on the time columns — measured on a full delivery to turn a multi-hour companies_unique timeout into about a minute.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — schools (flatten of $.education[*].school sub-object)
+//
+// One row per (raw.pdl_person record × education entry). Captures the
+// school sub-object that education entries embed. Dedup to one row per
+// school at pdl_person_schools_unique.
+//
+// Provenance: person_pdl_id + education_idx links each row back to the
+// source education entry.
+//
+// NOT in this table: location data. School location lives in
+// pdl_person_addresses_parsed with source_context='education_school' —
+// coarse-grain only (PDL does not emit street-level for schools).
+// (Note: location columns currently still also live on
+// pdl_person_education_parsed too; dropping them is an open cleanup item.)
+//
+// Bool-placeholder verification: nested URL fields on schools — facebook_url,
+// twitter_url, linkedin_url, website — are verified CLEAN at school-grain
+// (no bool-placeholders in a large sample). The PDL bool-placeholder pattern is
+// strictly a top-level-person-field phenomenon; do not re-test at school-grain.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_schools_parsed {
+  // Ingester provenance
+  partition_id                              smallint     [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz  [note: 'When the ingester loaded the parent raw row.']
+
+  // Source-record link (back to education entry that referenced this school)
+  person_pdl_id                             text         [note: 'PDL person id (parent record).']
+  education_idx                             int4         [note: 'Which education entry referenced this school. 1-based array index from FOR ORDINALITY.']
+
+  // School sub-object scalars
+  school_pdl_id                             text         [note: 'PDL education[].school.id — natural key, deduped at pdl_person_schools_unique.']
+  school_name                               text         [note: 'PDL education[].school.name.']
+  school_type                               text         [note: '"university" | "secondary school" | etc.']
+  school_domain                             text         [note: 'Primary domain name (e.g. "example.edu"). Useful join key against email-extracted domains.']
+  school_website                            text         [note: 'Primary school website URL.']
+  school_linkedin_url                       text         [note: 'Public LinkedIn URL for the school.']
+  school_linkedin_id                        text         [note: 'PDL-internal LinkedIn school id (numeric string).']
+  school_facebook_url                       text         [note: 'Public Facebook URL.']
+  school_twitter_url                        text         [note: 'Public Twitter / X URL.']
+
+  Indexes {
+    person_pdl_id   [name: 'idx_pdl_person_schools_parsed_person_pdl_id']
+    school_pdl_id   [name: 'idx_pdl_person_schools_parsed_school_pdl_id']
+    partition_id    [name: 'idx_pdl_person_schools_parsed_partition_id']
+    (school_pdl_id, loaded_at, partition_id) [name: 'idx_pdl_person_schools_parsed_dedup']
+  }
+
+  Note: 'PDL education[].school flattened. One row per (raw.pdl_person record × education entry). Source for pdl_person_schools_unique (dedup by school_pdl_id). School location lives separately in pdl_person_addresses_parsed (source_context = education_school, coarse-grain only). The _dedup covering index supports DISTINCT ON dedup in pdl_person_schools_unique; Flyway V19 creates it with DESC ordering on time columns.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — addresses (UNION ALL of 3 source paths)
+//
+// One unified table for all addresses found in a PDL person payload.
+// source_context distinguishes which JSON path produced the row:
+//
+//   - 'person_home'           ← $.location_*                         (top-level scalars)
+//   - 'experience_company_hq' ← $.experience[*].company.location.*   (nested)
+//   - 'education_school'      ← $.education[*].school.location.*     (nested, coarse-grain only)
+//
+// `job_company_hq` is NOT a separate branch — `$.job_company_location_*`
+// duplicates the experience entry's company location for the is_primary
+// experience (per docs/design/15 decision #3). Drop the redundant
+// branch; integration models pick the current job's HQ from
+// experience_company_hq where is_primary=true.
+//
+// source_idx is the array index (experience_idx or education_idx) for
+// nested paths; 0 for the person_home top-level branch so the unique
+// constraint covers it under NOT-NULL semantics.
+//
+// All 3 branches produce the same 10-column shape (UNION ALL). Branch-
+// specific field availability:
+//   - person_home: name, locality, region, country, metro, continent,
+//     postal_code, geo populated. street_address + address_line_2 are
+//     ALWAYS NULL — PDL emits "false"/"true" boolean placeholders for
+//     these on person_home, never real addresses.
+//   - experience_company_hq: all 10 fields populated where PDL has data.
+//   - education_school: name, locality, region, country, continent
+//     populated. metro, street_address, address_line_2, postal_code, geo
+//     always NULL (PDL doesn't emit street-level for schools).
+//
+// Per docs/design/15 decision #3 — Option A (one table, three UNION'd source
+// contexts). Location columns currently still also
+// live on pdl_person_parsed / pdl_person_experience_parsed /
+// pdl_person_education_parsed. Cleanup to a single home (this table)
+// is the Option B cleanup target.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_addresses_parsed {
+  // Ingester provenance
+  partition_id                              smallint     [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz  [note: 'When the ingester loaded the parent raw row.']
+
+  // Source identity (natural key components for the _unique tier)
+  person_pdl_id                             text         [note: 'PDL person id (parent record).']
+  source_context                            text         [note: "One of 'person_home', 'experience_company_hq', 'education_school'. ('job_company_hq' dropped as redundant with is_primary experience entry.)"]
+  source_idx                                int4         [note: 'experience_idx or education_idx for nested paths; 0 for the person_home top-level branch. NOT NULL — top-level rows use 0 so the unique constraint covers them.']
+
+  // Location scalars (PDL location.*)
+  name                                      text         [note: 'PDL location.name — display string like "New York, NY, United States". Denormalized; integration recomputes from ref.location members via the address view (doc 12 §7) rather than persisting.']
+  locality                                  text         [note: 'PDL location.locality (city). Resolves to ref.city at integration via composite key (country_id, state_province_id, name_lc). Doc 12 §5.']
+  region                                    text         [note: 'PDL location.region (state / province). Resolves to ref.state_province at integration via (country_id, name_lc). Doc 12 §5.']
+  country                                   text         [note: 'PDL location.country (full country name). Resolves to ref.country at integration via name_lc upsert. Doc 12 §5.']
+  metro                                     text         [note: 'PDL location.metro (e.g. "san francisco bay area"). Resolves to ref.metro at integration via (country_id, name_lc). NULL for education_school rows (coarse-grain only). Doc 12 §5.']
+  continent                                 text         [note: 'PDL location.continent. Resolves to ref.continent at integration; set as advisory metadata on ref.country.continent_id on first country insert. Doc 12 §5.']
+  street_address                            text         [note: 'PDL location.street_address. Lands in integration.company.street_address (experience_company_hq rows). NULL for education_school rows (coarse-grain only) and NULL for person_home rows (in the PDL field bundle this pipeline receives, PDL emits "false"/"true" bool placeholders there; filtered to NULL at parse time).']
+  address_line_2                            text         [note: 'PDL location.address_line_2. NULL for education_school rows. Same bool-placeholder filter as street_address on person_home.']
+  postal_code                               text         [note: 'PDL location.postal_code. Lands in integration.person / integration.company postal_code. NULL for education_school rows.']
+  geo                                       text         [note: 'PDL location.geo — "lat,lng" string. NULL for education_school rows. Parsed to numeric latitude / longitude on integration.person / integration.company.']
+
+  Indexes {
+    person_pdl_id                          [name: 'idx_pdl_person_addresses_parsed_person_pdl_id']
+    (source_context, source_idx)           [name: 'idx_pdl_person_addresses_parsed_source']
+    partition_id                           [name: 'idx_pdl_person_addresses_parsed_partition_id']
+    (person_pdl_id, source_context, source_idx, loaded_at, partition_id) [name: 'idx_pdl_person_addresses_parsed_dedup']
+  }
+
+  Note: 'PDL addresses unified across 3 source paths via UNION ALL (Option A from docs/design/15 decision #3). source_context distinguishes person_home / experience_company_hq / education_school. job_company_hq dropped as redundant with is_primary experience entry. Source for pdl_person_addresses_unique. Provenance preserved per row via (person_pdl_id, source_context, source_idx). The _dedup covering index supports DISTINCT ON dedup in pdl_person_addresses_unique; Flyway V19 creates it with DESC ordering on time columns.'
+}
+
+// -----------------------------------------------------------------------------
+// NOTE: staging.pdl_person_profiles_parsed removed (V11).
+// Verified against a full delivery: profile_id is NULL on every row,
+// making the natural-key dedup at pdl_person_profiles_unique
+// structurally broken (NULL profile_ids can't be told apart in SQL).
+// The four major social networks (LinkedIn, Facebook, Twitter, GitHub)
+// are already covered by top-level scalars on pdl_person_parsed
+// (linkedin_*, facebook_*, twitter_*, github_*). LinkedIn lives on
+// integration.person directly (canonical primary). The plan to re-source
+// the other three into integration.person_social_network was dropped when
+// V16 found those scalars to be bool-placeholders and removed the table.
+// Accepted data loss: minor networks (Instagram, Stack Overflow, etc.)
+// and per-profile timestamps. Low value for the person-search
+// use case. Table dropped in V11__staging_drop_pdl_person_profiles_parsed.sql.
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// NOTE: staging.pdl_person_certifications_parsed and
+// staging.pdl_person_languages_parsed removed (V10). The PDL field bundle
+// this pipeline receives does not deliver $.certifications[*] or
+// $.languages[*] at any nesting depth (verified across a full delivery
+// and a sample of the next one). Integration-layer
+// integration.person_certification and integration.person_language were
+// kept at that point (person_certification was later dropped in V16).
+// Tables dropped in V10__staging_drop_pdl_person_certifications_and_languages.sql.
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// PDL person — deduplicated + alias-resolved (one row per current pdl_id)
+//
+// Reads pdl_person_parsed (current delivery's raw flatten, may have within-
+// delivery duplicates for the same pdl_id) and produces one row per current
+// pdl_id. Two operations:
+//
+//   1. Alias resolution via catalog.pdl_id_aliases: a recursive walk of
+//      each alias chain (A → B → C) to its terminal pdl_id, capped at 10
+//      hops, with 2-cycles (A → B, B → A) canonicalized to LEAST(A, B).
+//      The singular tests processing/dbt/tests/pdl_person_unique_alias_cycle_guard.sql
+//      and pdl_person_unique_alias_hop_cap.sql warn on longer cycles and
+//      cap hits.
+//
+//   2. Dedup via DISTINCT ON (pdl_id) ORDER BY loaded_at DESC, partition_id DESC.
+//      Within-delivery duplicates may later need extra tie-breakers (e.g.
+//      num_sources). Generic test `unique(pdl_id)` in schema.yml catches
+//      dedup failures.
+//
+// Shape: mirrors pdl_person_parsed (same scalar columns + same 5 jsonb
+// array columns), minus the columns V12 / V16 dropped. Column duplication
+// accepted for now — the planned compiler will solve it. integration.person
+// reads from here directly; no JOIN to parsed needed.
+//
+// Indexes: pdl_id (UNIQUE), partition_id.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_unique {
+  // Ingester provenance
+  partition_id                              smallint     [note: 'Ingester provenance — winning row\'s partition_id.']
+  loaded_at                                 timestamptz  [note: 'Ingester provenance — winning row\'s loaded_at.']
+
+  // Record metadata
+  pdl_id                                    text         [note: 'PDL natural key, ALIAS-RESOLVED (recursive walk of catalog.pdl_id_aliases + 2-cycle canonicalization to LEAST(A,B)). UNIQUE in this table. Doc 13 §4.1.']
+  first_seen                                timestamptz  [note: 'PDL first_seen — when the record entered PDL.']
+  num_sources                               int4         [note: 'PDL num_sources — count of upstream data sources that contributed to this record.']
+  num_records                               int4         [note: 'PDL num_records — count of underlying source records merged into this PDL record.']
+  dataset_version                           text         [note: 'PDL dataset_version (e.g. "NN.N"). Diagnostic for schema drift across deliveries.']
+  operation_id                              text         [note: 'PDL Data License delivery operation identifier.']
+
+  // Names
+  first_name                                text         [note: 'PDL first_name.']
+  middle_name                               text         [note: 'PDL middle_name.']
+  middle_initial                            text         [note: 'Single-character middle initial. PDL emits separately from middle_name; either or both may be populated.']
+  last_name                                 text         [note: 'PDL last_name.']
+  last_initial                              text         [note: 'Single-character last initial.']
+  full_name                                 text         [note: 'PDL-concatenated full name.']
+
+  // Bio
+  headline                                  text         [note: 'PDL headline — short professional tagline.']
+  summary                                   text         [note: 'PDL summary — long-form bio prose.']
+  industry                                  text         [note: 'PDL canonical person-level industry (v1 taxonomy). Reflects the person\'s current-job industry, not a historical aggregate.']
+  sex                                       text         [note: 'PDL sex — single-character. PII-sensitive; doc 13 §6.1 governs retention.']
+
+  // Inferred
+  inferred_years_experience                 int4         [note: 'PDL-derived years of professional experience. Inferred, not authoritative.']
+  inferred_salary                           text         [note: 'PDL-derived salary band (text — e.g. "100,000-150,000"; not numeric). Inferred, not authoritative.']
+
+  // Contact (PII-allowed subset; mobile_phone dropped in V16 — confirmed
+  // PDL bool-placeholder)
+  work_email                                text         [note: 'Work email address. PII-allowed per docs/data_model/13 §6.1.']
+
+  // Freshness signals (V17). Real per-record PDL dates carried from
+  // pdl_person_parsed → here verbatim. Populated for most but not all
+  // persons. integration.person casts to timestamptz; staging stays at date.
+  job_last_changed                          date         [note: 'PDL freshness signal — date the current job last changed per PDL. Populated for most but not all persons. Identity-resolution + job-history work must decide a NULL strategy for the rest.']
+  job_last_verified                         date         [note: 'PDL freshness signal — date PDL last verified the current employment. Populated for most but not all persons. Same NULL-handling caveat as job_last_changed.']
+  location_last_updated                     date         [note: 'PDL freshness signal — date PDL last updated location info. Populated for most but not all persons. Same NULL-handling caveat.']
+
+  // Current job + current company "flat" columns DROPPED in V12.
+  // These 41 columns (job_title, job_title_*, job_onet_*, job_company_*,
+  // job_company_location_*) duplicate the is_primary=true entry in
+  // $.experience[*] — the canonical home for "current job" data is
+  // pdl_person_experience_unique where is_primary=true. Integration models
+  // pick the current job from there.
+  //
+  // The dropped columns are still on pdl_person_parsed for now (additive-
+  // only path per Option A); cleanup from pdl_person_parsed
+  // is the Option B cleanup target.
+
+  // Social — LinkedIn at top level
+  linkedin_id                               text         [note: 'PDL-internal LinkedIn person id (numeric string). Cross-source join key per docs/requirements/01 §4.']
+  linkedin_url                              text         [note: 'Public LinkedIn URL. Cross-source join key per docs/requirements/01 §4.']
+  linkedin_username                         text         [note: 'LinkedIn vanity-URL username slug.']
+  linkedin_connections                      int4         [note: 'PDL linkedin_connections — connection-count integer.']
+
+  // Social — other (facebook/twitter/github URL+id+username dropped in V16
+  // as PDL bool-placeholders). facebook_friends is the always-NULL int4 companion of
+  // facebook_url; kept (not in the V16 drop list).
+  facebook_friends                          int4         [note: 'PDL facebook_friends — friend-count integer. Always NULL in the PDL field bundle this pipeline receives (paired with the facebook_url bool-placeholder dropped in V16). Companion column retained for now; consider dropping later if no use case emerges.']
+
+  // Person home location_* columns DROPPED in V12.
+  // Person home location lives in pdl_person_addresses_parsed /
+  // pdl_person_addresses_unique with source_context='person_home'.
+  // Note: location_street_address + location_address_line_2 were the
+  // PDL bool-placeholder columns ("false"/"true" strings, never real values);
+  // they would never have been usable here anyway.
+  // location_* columns are still on pdl_person_parsed for now (Option A
+  // additive-only path). Cleanup from pdl_person_parsed
+  // is the Option B cleanup target.
+
+  // Simple text arrays kept as jsonb (mirrors pdl_person_parsed).
+  // name_aliases dropped in V16 (never populated).
+  skills                                    jsonb        [note: 'PDL skills — jsonb array of canonical skill strings. Integration unnests at consume time and dedups via ref.skill upsert (docs/design/15 + ADR-0005).']
+  interests                                 jsonb        [note: 'PDL interests — jsonb array of canonical interest strings. Same unnest-then-ref pattern as skills.']
+  location_names                            jsonb        [note: 'PDL location_names — jsonb array of display-name strings for places the person has been associated with. Distinct from $.location_* current-home scalars (in pdl_person_addresses_parsed).']
+  countries                                 jsonb        [note: 'PDL countries — jsonb array of country strings the person has been associated with (historical / multi-residence). Distinct from current $.location.country.']
+  regions                                   jsonb        [note: 'PDL regions — jsonb array of region (state / province) strings the person has been associated with.']
+
+  Indexes {
+    pdl_id         [unique, name: 'pdl_person_unique_pdl_id_uk']
+    partition_id   [name: 'idx_pdl_person_unique_partition_id']
+  }
+
+  Note: 'PDL person, deduplicated + alias-resolved. One row per current pdl_id. UNIQUE constraint on pdl_id enforced at the DDL level (matches the dbt schema.yml unique test as belt-and-suspenders). Mirrors pdl_person_parsed shape (scalars + 5 jsonb array columns; name_aliases dropped in V16 — never populated). Populated by processing/dbt/models/staging/pdl_person/pdl_person_unique.sql.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — experience deduplicated (one row per natural key)
+//
+// Reads pdl_person_experience_parsed. Dedups via
+// DISTINCT ON (person_pdl_id, company_pdl_id, start_year, title_name)
+// ORDER BY loaded_at DESC, partition_id DESC (placeholder dedup ordering).
+//
+// Natural key per docs/design/15: 4 columns including title_name
+// as discriminator. The discriminator preserves legitimate distinctions
+// (promotions, multi-title roles within the same person/company/year)
+// that the 3-column key would have wrong-merged. On a full delivery it
+// cut the 3-column key's duplicate groups to a negligible handful.
+//
+// NULL handling: rows with NULL in any natural-key column survive
+// un-deduped (Postgres treats each NULL as distinct under UNIQUE).
+// A sizeable share of experience rows have NULL in company_pdl_id or
+// start_year — acceptable per design.
+//
+// Shape: mirrors pdl_person_experience_parsed exactly (same columns,
+// same types). UNIQUE constraint is the only structural difference.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_experience_unique {
+  // Ingester provenance (winning row's)
+  partition_id                              smallint         [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz         [note: 'Ingester provenance — when the ingester loaded the raw row.']
+
+  // Person link
+  person_pdl_id                             text         [note: 'PDL person id (parent record) — join key to pdl_person_parsed.']
+  experience_idx                            int4         [note: 'Winning row\'s experience_idx. Arbitrary across runs if multiple distinct idx values had the same natural key (placeholder dedup ordering).']
+
+  // Per-experience scalars
+  start_year                                int4         [note: 'Year extracted from PDL experience[].start_date (sent as "yyyy", "yyyy-mm", or "yyyy-mm-dd"). Day/month dropped by design (year-only across the board). Nullable: PDL frequently omits the date entirely.']
+  end_year                                  int4         [note: 'Year extracted from PDL experience[].end_date. NULL = current position OR PDL did not send a date. Same extraction rule as start_year.']
+  is_primary                                bool         [note: 'PDL experience[].is_primary — true for the current role.']
+  summary                                   text         [note: 'PDL experience[].summary — free-text description of the role.']
+  first_seen                                timestamptz         [note: 'PDL experience[].first_seen — provenance metadata.']
+  last_seen                                 timestamptz         [note: 'PDL experience[].last_seen — provenance metadata.']
+  num_sources                               int4         [note: 'PDL experience[].num_sources — provenance metadata.']
+
+  // Title (title_name is the 4th component of the natural key)
+  title_name                                text         [note: 'PDL experience[].title.name (raw title string).']
+  title_role                                text         [note: 'PDL experience[].title.role (canonical role enum).']
+  title_sub_role                            text         [note: 'PDL experience[].title.sub_role (canonical sub-role enum).']
+  title_class                               text         [note: 'PDL experience[].title.class (canonical class enum).']
+  title_levels                              jsonb         [note: 'PDL experience[].title.levels[] as jsonb — array of seniority-level strings.']
+  title_raw                                 jsonb         [note: 'PDL experience[].title.raw — array of raw title variants the person entered.']
+
+  // Company sub-object scalars (company_pdl_id is the 2nd component of the natural key)
+  company_pdl_id                            text         [note: 'PDL experience[].company.id — company natural key.']
+  company_name                              text         [note: 'PDL experience[].company.name. NULL when PDL did not link the experience to a tracked company.']
+  company_size                              text         [note: 'PDL canonical employee-count band ("1-10", "11-50", "51-200", …, "10001+"). Free-text canonical, not numeric — keep as text.']
+  company_type                              text         [note: '"public" | "private" | "educational" | "non_profit" | "government"']
+  company_founded                           int4         [note: 'Founding year (4-digit).']
+  company_industry                          text         [note: 'PDL canonical industry v1.']
+  company_industry_v2                       text         [note: 'PDL canonical industry v2 (newer taxonomy; both versions kept verbatim).']
+  company_ticker                            text         [note: 'Stock ticker. Populated only if company_type=public.']
+  company_website                           text         [note: 'Primary website URL.']
+  company_linkedin_url                      text         [note: 'Public LinkedIn URL for the company.']
+  company_linkedin_id                       text         [note: 'PDL-internal LinkedIn company id (numeric string).']
+  company_facebook_url                      text         [note: 'Public Facebook URL.']
+  company_twitter_url                       text         [note: 'Public Twitter / X URL.']
+
+  // Company location (carried down from parsed per Option A; cleanup to addresses-only is the Option B target)
+  company_location_name                     text         [note: 'PDL experience[].company.location.name — display string. Denormalized; derivable from the ref.location hierarchy. Doc 12 §5.']
+  company_location_street_address           text         [note: 'PDL experience[].company.location.street_address. Doc 12 §5.']
+  company_location_address_line_2           text         [note: 'PDL experience[].company.location.address_line_2. Doc 12 §5.']
+  company_location_locality                 text         [note: 'PDL experience[].company.location.locality (city). Resolves to ref.city via (country_id, state_province_id, name_lc). Doc 12 §5.']
+  company_location_region                   text         [note: 'PDL experience[].company.location.region (state / province). Resolves to ref.state_province via (country_id, name_lc). Doc 12 §5.']
+  company_location_country                  text         [note: 'PDL experience[].company.location.country. Resolves to ref.country via name_lc upsert. Doc 12 §5.']
+  company_location_continent                text         [note: 'PDL experience[].company.location.continent. Resolves to ref.continent; advisory metadata on ref.country.continent_id. Doc 12 §5.']
+  company_location_metro                    text         [note: 'PDL experience[].company.location.metro. Resolves to ref.metro via (country_id, name_lc). Doc 12 §5.']
+  company_location_postal_code              text         [note: 'PDL experience[].company.location.postal_code. Doc 12 §5.']
+  company_location_geo                      text         [note: 'PDL experience[].company.location.geo — "lat,lng" string. Parsed to numeric latitude / longitude at consume time. Doc 12 §5.']
+
+  // Multi-valued per-experience jsonb
+  location_names                            jsonb         [note: 'PDL experience[].location_names[] — work locations as jsonb array.']
+  raw_names                                 jsonb         [note: 'PDL experience[].raw[] — array of free-text employer names the person typed.']
+
+  Indexes {
+    (person_pdl_id, company_pdl_id, start_year, title_name) [unique, name: 'uq_pdl_person_experience_unique_nk']
+    company_pdl_id                                           [name: 'idx_pdl_person_experience_unique_company_pdl_id']
+  }
+
+  Note: 'PDL experience deduplicated by 4-column natural key (person_pdl_id, company_pdl_id, start_year, title_name). Dedup ordering: loaded_at DESC, partition_id DESC. Source for integration.experience.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — education deduplicated (one row per natural key)
+//
+// Reads pdl_person_education_parsed. Dedups via
+// DISTINCT ON (person_pdl_id, school_pdl_id, start_year, degrees_text)
+// ORDER BY loaded_at DESC, partition_id DESC (placeholder dedup ordering).
+//
+// degrees_text is a plain text column populated by the dbt model SELECT
+// as `degrees::text`. Needed because Postgres UNIQUE constraints can't
+// be defined directly on a jsonb expression. The degrees jsonb is
+// preserved alongside (used by integration); degrees_text is the dedup
+// discriminator only.
+//
+// History: V12 originally defined this column as STORED GENERATED. V13
+// dropped the generated expression because dbt-postgres's default
+// incremental+append INSERT macro can't insert into tables with
+// GENERATED ALWAYS columns. Computation moved to dbt SELECT.
+//
+// Natural key 4-column per docs/design/15. On a full delivery it cut the
+// 3-column key's duplicate groups substantially. Residual duplicates are mostly "same person at same school same year,
+// both with empty degrees=[]" — PDL emitted these as separate rows.
+//
+// Shape: mirrors pdl_person_education_parsed + degrees_text.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_education_unique {
+  // Ingester provenance (winning row's)
+  partition_id                              smallint         [note: 'From raw.pdl_person.partition_id.']
+  loaded_at                                 timestamptz         [note: 'Ingester provenance — when the ingester loaded the raw row.']
+
+  // Person link
+  person_pdl_id                             text         [note: 'PDL person id (parent record).']
+  education_idx                             int4         [note: 'Winning row\'s education_idx. Arbitrary across runs (same caveat as experience_idx on pdl_person_experience_unique).']
+
+  // Per-education scalars
+  start_year                                int4         [note: 'Year extracted from PDL education[].start_date (sent as "yyyy", "yyyy-mm", or "yyyy-mm-dd"). Day/month dropped by design. Nullable: PDL frequently omits the date entirely.']
+  end_year                                  int4         [note: 'Year extracted from PDL education[].end_date. Same rule as start_year.']
+  gpa                                       "numeric(4,2)"         [note: 'PDL education[].gpa (numeric(4,2)).']
+  summary                                   text         [note: 'PDL education[].summary — free-text description.']
+
+  // Multi-valued jsonb (degrees is the source of the 4th natural-key component via degrees_text)
+  degrees                                   jsonb         [note: 'PDL education[].degrees — array of degree-name strings.']
+  degrees_text                              text         [note: 'Plain text column populated by dbt SELECT as degrees::text. Dedup discriminator only — Postgres unique cannot be defined directly on a jsonb expression. V12 originally defined this as STORED GENERATED; V13 dropped the expression so dbt can INSERT a computed value.']
+  majors                                    jsonb         [note: 'PDL education[].majors — array of major-name strings.']
+  minors                                    jsonb         [note: 'PDL education[].minors — array of minor-name strings.']
+  raw_names                                 jsonb         [note: 'PDL education[].raw — array of free-text school-name variants.']
+
+  // School sub-object scalars (school_pdl_id is the 2nd component of the natural key)
+  school_pdl_id                             text         [note: 'PDL education[].school.id — school natural key.']
+  school_name                               text         [note: 'PDL education[].school.name.']
+  school_type                               text         [note: '"university" | "secondary school" | etc.']
+  school_domain                             text         [note: 'Primary domain name (e.g. "example.edu"). Useful join key against email-extracted domains.']
+  school_website                            text         [note: 'Primary school website URL.']
+  school_linkedin_url                       text         [note: 'Public LinkedIn URL for the school.']
+  school_linkedin_id                        text         [note: 'PDL-internal LinkedIn school id (numeric string).']
+  school_facebook_url                       text         [note: 'Public Facebook URL.']
+  school_twitter_url                        text         [note: 'Public Twitter / X URL.']
+
+  // School location (coarse-grain only — carried down from parsed per Option A; cleanup to addresses-only is an open item)
+  school_location_continent                 text         [note: 'PDL education[].school.location.continent. Resolves to ref.continent. Doc 12 §5. School location is coarse-grain (no street / metro).']
+  school_location_country                   text         [note: 'PDL education[].school.location.country. Resolves to ref.country via name_lc upsert. Doc 12 §5.']
+  school_location_region                    text         [note: 'PDL education[].school.location.region (state / province). Resolves to ref.state_province via (country_id, name_lc). Doc 12 §5.']
+  school_location_locality                  text         [note: 'PDL education[].school.location.locality (city). Resolves to ref.city via (country_id, state_province_id, name_lc). Doc 12 §5.']
+
+  Indexes {
+    (person_pdl_id, school_pdl_id, start_year, degrees_text) [unique, name: 'uq_pdl_person_education_unique_nk']
+    school_pdl_id                                            [name: 'idx_pdl_person_education_unique_school_pdl_id']
+  }
+
+  Note: 'PDL education deduplicated by 4-column natural key (person_pdl_id, school_pdl_id, start_year, degrees_text). degrees_text is a plain text column computed by dbt as degrees::text — needed because Postgres UNIQUE cannot be defined directly on a jsonb expression. Dedup ordering: loaded_at DESC, partition_id DESC. Source for integration.person_education.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — companies deduplicated (one row per company_pdl_id)
+//
+// Reads pdl_person_companies_parsed. Dedups via
+// DISTINCT ON (company_pdl_id) ORDER BY loaded_at DESC, partition_id DESC
+// (placeholder dedup ordering). One row per unique company across all
+// (person × experience) source rows that referenced it.
+//
+// Per-row source provenance (person_pdl_id, experience_idx) IS DROPPED —
+// this is a per-company canonical row, not per-occurrence. Integration
+// entities that need provenance back to a specific experience use the
+// experience_unique → companies_unique JOIN, not provenance columns here.
+//
+// Filter: company_pdl_id IS NOT NULL (rows from experiences PDL didn't
+// link to a tracked company don't contribute to integration.company).
+// Implemented in the dbt model.
+//
+// PDL company aliases: NOT used — PDL's Person delivery
+// MERGED_RECORDS only contains person id pairs.
+// PDL Company API merges are handled separately.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_companies_unique {
+  // Ingester provenance (winning row's)
+  partition_id                              smallint     [note: 'Ingester provenance — winning row\'s partition_id.']
+  loaded_at                                 timestamptz  [note: 'Ingester provenance — winning row\'s loaded_at.']
+
+  // Natural key
+  company_pdl_id                            text         [not null, note: 'PDL company id. UNIQUE in this table.']
+
+  // Company attributes (semantics mirror pdl_person_companies_parsed)
+  company_name                              text         [note: 'PDL experience[].company.name. NULL when PDL did not link the experience to a tracked company.']
+  company_size                              text         [note: 'PDL canonical employee-count band ("1-10", "11-50", "51-200", …, "10001+"). Free-text canonical, not numeric — keep as text.']
+  company_type                              text         [note: '"public" | "private" | "educational" | "non_profit" | "government"']
+  company_founded                           int4         [note: 'Founding year (4-digit).']
+  company_industry                          text         [note: 'PDL canonical industry v1.']
+  company_industry_v2                       text         [note: 'PDL canonical industry v2 (newer taxonomy; both versions kept verbatim).']
+  company_ticker                            text         [note: 'Stock ticker. Populated only if company_type=public.']
+  company_website                           text         [note: 'Primary website URL.']
+  company_linkedin_url                      text         [note: 'Public LinkedIn URL for the company.']
+  company_linkedin_id                       text         [note: 'PDL-internal LinkedIn company id (numeric string).']
+  company_facebook_url                      text         [note: 'Public Facebook URL.']
+  company_twitter_url                       text         [note: 'Public Twitter / X URL.']
+
+  Indexes {
+    company_pdl_id [unique, name: 'uq_pdl_person_companies_unique_nk']
+  }
+
+  Note: 'PDL companies deduplicated by company_pdl_id. One row per unique company across all (person × experience) source rows. dbt model filters company_pdl_id IS NOT NULL. Source for integration.company.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — schools deduplicated (one row per school_pdl_id)
+//
+// Reads pdl_person_schools_parsed. Dedups via
+// DISTINCT ON (school_pdl_id) ORDER BY loaded_at DESC, partition_id DESC.
+// One row per unique school across all (person × education) source rows.
+//
+// Per-row source provenance dropped (same reasoning as
+// pdl_person_companies_unique). Filter: school_pdl_id IS NOT NULL.
+//
+// No school alias ledger (PDL's Person delivery MERGED_RECORDS
+// only emits person id pairs).
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_schools_unique {
+  // Ingester provenance (winning row's)
+  partition_id                              smallint     [note: 'Ingester provenance — winning row\'s partition_id.']
+  loaded_at                                 timestamptz  [note: 'Ingester provenance — winning row\'s loaded_at.']
+
+  // Natural key
+  school_pdl_id                             text         [not null, note: 'PDL school id. UNIQUE in this table.']
+
+  // School attributes (semantics mirror pdl_person_schools_parsed)
+  school_name                               text         [note: 'PDL education[].school.name.']
+  school_type                               text         [note: '"university" | "secondary school" | etc.']
+  school_domain                             text         [note: 'Primary domain name (e.g. "example.edu"). Useful join key against email-extracted domains.']
+  school_website                            text         [note: 'Primary school website URL.']
+  school_linkedin_url                       text         [note: 'Public LinkedIn URL for the school.']
+  school_linkedin_id                        text         [note: 'PDL-internal LinkedIn school id (numeric string).']
+  school_facebook_url                       text         [note: 'Public Facebook URL.']
+  school_twitter_url                        text         [note: 'Public Twitter / X URL.']
+
+  Indexes {
+    school_pdl_id [unique, name: 'uq_pdl_person_schools_unique_nk']
+  }
+
+  Note: 'PDL schools deduplicated by school_pdl_id. One row per unique school across all (person × education) source rows. dbt model filters school_pdl_id IS NOT NULL. Source for integration.school.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL person — addresses deduplicated (one row per source-position identity)
+//
+// Reads pdl_person_addresses_parsed. Dedups via
+// DISTINCT ON (person_pdl_id, source_context, source_idx)
+// ORDER BY loaded_at DESC, partition_id DESC.
+//
+// Natural key IS the row's identity in the source PDL record (not its
+// content) — address content is never deduplicated across entities
+// ("formatting variance across sources makes cross-entity dedup not worth
+// fighting").
+//
+// Content dedup is handled (or deliberately not) downstream:
+//   - ref.location: composite UNIQUE on (country, state, city, metro)
+//     dedups the geographic hierarchy.
+//   - street-level scalars: carried inline on integration.person (V20) and
+//     integration.company (V24) without content dedup.
+//
+// Shape: mirrors pdl_person_addresses_parsed exactly.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_person_addresses_unique {
+  // Ingester provenance (winning row's)
+  partition_id                              smallint     [note: 'Ingester provenance — winning row\'s partition_id.']
+  loaded_at                                 timestamptz  [note: 'Ingester provenance — winning row\'s loaded_at.']
+
+  // Natural key
+  person_pdl_id                             text         [not null, note: 'PDL person id (parent record). Part of composite natural key.']
+  source_context                            text         [not null, note: "One of 'person_home', 'experience_company_hq', 'education_school'. Part of composite natural key."]
+  source_idx                                int4         [not null, note: 'experience_idx or education_idx for nested paths; 0 for the person_home top-level branch. Part of composite natural key.']
+
+  // Location scalars (semantics mirror pdl_person_addresses_parsed)
+  name                                      text         [note: 'PDL location.name — display string. Denormalized; integration recomputes from ref.location members via the address view (doc 12 §7).']
+  locality                                  text         [note: 'PDL location.locality (city). Resolves to ref.city via (country_id, state_province_id, name_lc). Doc 12 §5.']
+  region                                    text         [note: 'PDL location.region (state / province). Resolves to ref.state_province via (country_id, name_lc). Doc 12 §5.']
+  country                                   text         [note: 'PDL location.country. Resolves to ref.country via name_lc upsert. Doc 12 §5.']
+  metro                                     text         [note: 'PDL location.metro. NULL for education_school rows (coarse-grain only). Doc 12 §5.']
+  continent                                 text         [note: 'PDL location.continent. Resolves to ref.continent; advisory metadata on ref.country.continent_id. Doc 12 §5.']
+  street_address                            text         [note: 'PDL location.street_address. NULL for education_school rows; NULL for person_home rows (bool-placeholder filtered).']
+  address_line_2                            text         [note: 'PDL location.address_line_2. NULL for education_school rows. Same bool-placeholder filter as street_address on person_home.']
+  postal_code                               text         [note: 'PDL location.postal_code. NULL for education_school rows.']
+  geo                                       text         [note: 'PDL location.geo — "lat,lng" string. NULL for education_school rows. Parsed to numeric latitude / longitude at integration layer.']
+
+  Indexes {
+    (person_pdl_id, source_context, source_idx) [unique, name: 'uq_pdl_person_addresses_unique_nk']
+    person_pdl_id                                [name: 'idx_pdl_person_addresses_unique_person_pdl_id']
+  }
+
+  Note: 'PDL addresses deduplicated by (person_pdl_id, source_context, source_idx). One row per source-position identity. Source for integration.person home address (scalar lat/long/postal_code per V20 Option C), the inline company HQ address on integration.company (V24; formerly integration.company_hq_address, V21), and ref.location hierarchy population.
+
+  V22 added two PARTIAL btree indexes on this table that DBML cannot express (predicate WHERE clause not supported in Indexes blocks — same DBML caveat as V5 ref.location COALESCE indexes and V19 functional indexes; canonical DDL lives in V22__staging_pdl_person_addresses_partial_indexes.sql):
+
+    idx_pdl_person_addresses_unique_person_home
+      ON (person_pdl_id) WHERE source_context = ''person_home'' AND source_idx = 0
+      — supports integration.person home-address lookups (one entry per person with a home address)
+
+    idx_pdl_person_addresses_unique_company_hq
+      ON (person_pdl_id, source_idx) WHERE source_context = ''experience_company_hq''
+      — supports company HQ address lookups for integration.company (one entry per experience with company HQ data)
+
+  TODO (perf-evaluation deferred): test replacing the two partials with a single composite covering index `(source_context, person_pdl_id, source_idx)`. The composite would:
+    - serve all three source_context values (including future education_school)
+    - index every row of the table (larger than the two partials combined)
+    - simplify dbt_project.yml Pattern 1 hooks (one drop/recreate vs two)
+    - trade per-query cache locality for breadth of coverage
+  If measured perf with the composite is close to the partial version, switch to it for simplicity. The partial approach was chosen first because the source_context values are fixed (3 hardcoded by docs/design/15 design — no growth) and per-query footprint matters at integration-rebuild scale. Re-evaluate when integration.school is authored (third consumer of this access pattern).'
+}
+
+// =============================================================================
+// PDL Company Enrichment staging (V28; see docs/design/18_pdl_api_generic_caller.md)
+//
+// The PDL Company Enrichment caller writes per-record response_json into
+// pdl_api.company_enrichment_call (operational audit table — see
+// modeling/dbml/pdl_api.dbml). These staging models flatten the response
+// into queryable scalars + jsonb for downstream consumption by
+// integration.company + integration.company_affiliation.
+//
+// Pattern mirrors PDL person companies staging (pdl_person_companies_parsed
+// → pdl_person_companies_unique). _staged tier is skipped — no
+// catalog.pdl_inactive ledger applies to companies.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// PDL company enrichment — parsed (one row per response record, before dedup)
+//
+// Source: pdl_api.company_enrichment_call filtered to response_status=200
+// AND pdl_company_id IS NOT NULL.
+//
+// Pattern to copy at the dbt level: staging/pdl_person/pdl_person_companies_parsed.sql.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_api_company_parsed {
+  // Source-row provenance (one row per pdl_api.company_enrichment_call row)
+  enrichment_call_id              bigint      [note: 'pdl_api.company_enrichment_call.id — for replay/debug.']
+  bulk_batch_id                   bigint      [note: 'Caller batch identifier — groups records that shared one HTTP call.']
+  called_at                       timestamptz [note: 'HTTP call timestamp from pdl_api.company_enrichment_call.']
+
+  // Natural key
+  pdl_company_id                  text        [not null, note: 'PDL company id (response_json->>id). Already STORED GENERATED on source.']
+
+  // Shared scalars (also emitted by person.experience.company)
+  name                            text
+  size                            text
+  founded                         int4
+  industry                        text
+  type                            text
+  website                         text
+  linkedin_id                     text
+  linkedin_url                    text
+  facebook_url                    text
+  twitter_url                     text
+  ticker                          text
+
+  // Enrichment-only scalars
+  display_name                    text
+  linkedin_slug                   text
+  mic_exchange                    text
+  summary                         text
+  headline                        text
+  employee_count                  int4
+  inferred_revenue                text
+  immediate_parent                text        [note: 'Parent pdl_company_id (text scalar from response_json->>immediate_parent — not a nested object). Resolved to integration.company.id in the integration model.']
+  ultimate_parent                 text        [note: 'Same shape as immediate_parent.']
+  total_funding_raised            bigint
+  latest_funding_stage            text
+  last_funding_date               date
+  number_funding_rounds           smallint
+  dataset_version                 text
+  likelihood                      smallint
+
+  // Multi-valued enrichment fields — kept as jsonb at staging; integration writes them as jsonb on integration.company
+  naics                           jsonb       [note: 'Array of rich classification objects {sector, naics_code, sub_sector, industry_group, naics_industry, national_industry}.']
+  sic                             jsonb       [note: 'Array of rich classification objects {sic_code, major_group, industry_group, industry_sector}.']
+  tags                            jsonb       [note: 'Array of bare display-tag strings.']
+  alternative_names               jsonb       [note: 'Array of bare strings.']
+  alternative_domains             jsonb       [note: 'Array of bare strings.']
+  funding_stages                  jsonb       [note: 'Array of bare strings — per-round funding-stage history.']
+  employee_count_by_country       jsonb       [note: 'Object {country_name: count}.']
+  profiles                        jsonb       [note: 'PDL $.profiles[]. Array of multi-platform social URLs (LinkedIn, Twitter, Facebook, Crunchbase, etc.) — network names kept as free text inside the array; not normalized. V28.']
+  affiliated_entities             jsonb       [note: 'Array of objects {affiliated_id, display_name, relationship}. Sole source for integration.company_affiliation + integration.company stub rows. PDL''s sibling denormalizations ($.affiliated_profiles, $.direct_subsidiaries, $.all_subsidiaries) carry the same ID set and are not landed at staging.']
+
+  // Location flattened from $.location nested object (same 10-field shape as person.experience.company.location)
+  location_name                   text
+  location_locality               text
+  location_region                 text
+  location_country                text
+  location_continent              text
+  location_metro                  text
+  location_postal_code            text
+  location_street_address         text
+  location_address_line_2         text
+  location_geo                    text        [note: '"lat,lng" string; parsed to numeric(9,6) latitude/longitude in integration.']
+
+  Indexes {
+    pdl_company_id   [unique, name: 'uq_pdl_api_company_parsed_pdl_company_id']
+    called_at        [name: 'idx_pdl_api_company_parsed_called_at']
+    bulk_batch_id    [name: 'idx_pdl_api_company_parsed_bulk_batch_id']
+  }
+
+  Note: 'PDL Company Enrichment responses flattened. One row per pdl_company_id — UNIQUE because each Company Enrichment API call returns exactly one company response, and re-enrichment is not implemented (1:1 by API contract; dbt unique test enforces). integration.company reads this directly; the staging.pdl_api_company_unique step is documented (DBML below) but stays empty until re-enrichment lands. V28 added profiles jsonb column.'
+}
+
+// -----------------------------------------------------------------------------
+// PDL company enrichment — unique (one row per pdl_company_id, most recent successful)
+//
+// DEFERRED until re-enrichment lands. integration.company reads staging.pdl_api_company_parsed
+// directly because each Company Enrichment API call returns exactly one company
+// response and the pipeline doesn't re-fetch — _parsed is already 1:1 by construction.
+// V28 creates this table as EMPTY (per the DBML editing rule "DBML must never describe a state
+// no migration has produced"); no dbt model populates it today.
+//
+// When re-enrichment lands: add the dbt model with DISTINCT ON (pdl_company_id)
+// ORDER BY pdl_company_id, called_at DESC, enrichment_call_id DESC; switch
+// integration.company.sql to read from _unique. Mechanical change.
+//
+// Pattern to copy at the dbt level (when activated): staging/pdl_person/pdl_person_companies_unique.sql.
+// -----------------------------------------------------------------------------
+
+Table staging.pdl_api_company_unique {
+  // Source-row provenance (winning row's)
+  enrichment_call_id              bigint
+  bulk_batch_id                   bigint
+  called_at                       timestamptz
+
+  // Natural key
+  pdl_company_id                  text        [not null, note: 'PDL company id. UNIQUE in this table.']
+
+  // Shared scalars
+  name                            text
+  size                            text
+  founded                         int4
+  industry                        text
+  type                            text
+  website                         text
+  linkedin_id                     text
+  linkedin_url                    text
+  facebook_url                    text
+  twitter_url                     text
+  ticker                          text
+
+  // Enrichment-only scalars
+  display_name                    text
+  linkedin_slug                   text
+  mic_exchange                    text
+  summary                         text
+  headline                        text
+  employee_count                  int4
+  inferred_revenue                text
+  immediate_parent                text
+  ultimate_parent                 text
+  total_funding_raised            bigint
+  latest_funding_stage            text
+  last_funding_date               date
+  number_funding_rounds           smallint
+  dataset_version                 text
+  likelihood                      smallint
+
+  // Multi-valued (jsonb)
+  naics                           jsonb
+  sic                             jsonb
+  tags                            jsonb
+  alternative_names               jsonb
+  alternative_domains             jsonb
+  funding_stages                  jsonb
+  employee_count_by_country       jsonb
+  profiles                        jsonb
+  affiliated_entities             jsonb
+
+  // Location flattened
+  location_name                   text
+  location_locality               text
+  location_region                 text
+  location_country                text
+  location_continent              text
+  location_metro                  text
+  location_postal_code            text
+  location_street_address         text
+  location_address_line_2         text
+  location_geo                    text
+
+  Indexes {
+    pdl_company_id   [unique, name: 'uq_pdl_api_company_unique_nk']
+  }
+
+  Note: 'PDL Company Enrichment responses deduplicated by pdl_company_id. DEFERRED until re-enrichment lands — integration.company reads staging.pdl_api_company_parsed directly (1:1 by API contract). V28 creates this table as empty; no dbt model populates it. Activate by adding the _unique dbt model + switching integration.company.sql to read here.'
+}

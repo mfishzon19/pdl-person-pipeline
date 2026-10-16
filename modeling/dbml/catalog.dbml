@@ -1,0 +1,177 @@
+// =============================================================================
+// catalog.dbml — identity ledger + observability tables for the ETL pipeline
+//
+// Source of truth for the catalog schema. Authored by hand; do NOT edit
+// generated downstream artifacts (Flyway migrations, dbt schema.yml).
+//
+// Spec reference: docs/design/02_pipeline_design.md Section 9.
+// Generated artifact: modeling/flyway/migrations/V1__catalog_baseline.sql.
+// =============================================================================
+
+Project pdl_etl {
+  database_type: 'PostgreSQL'
+  Note: 'PDL ETL — catalog schema. Identity ledger + observability.'
+}
+
+// -----------------------------------------------------------------------------
+// Identity ledger (4 tables) — pipeline's stateful spine.
+// Persists across runs. Never rebuilt from raw.
+// -----------------------------------------------------------------------------
+
+Table catalog.pdl_id_aliases {
+  old_pdl_id      text [pk, not null, note: 'Losing pdl_id from PDL MERGED_RECORDS']
+  current_pdl_id  text [not null]
+  observed_at     timestamptz [not null]
+  delivery_date   date [not null, note: 'Which delivery surfaced this merge']
+
+  Indexes {
+    current_pdl_id [name: 'idx_pdl_id_aliases_current']
+  }
+
+  Note: 'PDL-internal merge mappings: old_pdl_id -> current_pdl_id. Append-only. Populated by PDL ingester from MERGED_RECORDS folder. Read by PDL staging (alias resolution).'
+}
+
+Table catalog.pdl_inactive {
+  pdl_id        text [not null]
+  reason        text [not null, note: "'deleted' | 'opted_out' | 'reactivated' ('reactivated' is reserved; nothing writes it yet)"]
+  observed_at   timestamptz [not null]
+  delivery_date date [not null]
+
+  Indexes {
+    (pdl_id, observed_at) [pk]
+    pdl_id [name: 'idx_pdl_inactive_pdl_id']
+  }
+
+  Note: 'Append-only audit log of PDL deactivation and reactivation events. Latest event per pdl_id determines current state. Populated by raw.project_pdl_deltas() from the DELETED_RECORDS / OPTED_OUT_RECORDS folders. Reactivation detection is not implemented; the reactivated reason is reserved.'
+}
+
+Table catalog.person_key_map {
+  internal_person_id bigserial [pk]
+  identity_signature text [unique, not null, note: 'Lookup key used to find or mint an internal_person_id. Exact construction is an open design decision (docs/requirements/01 §4.2); changing it between runs is a breaking change.']
+  status             text [not null, note: "'active' | 'inactive' | 'merged_into'"]
+  merged_into_id     bigint [ref: > catalog.person_key_map.internal_person_id, note: 'Non-null when status=merged_into']
+  first_seen_at      timestamptz [not null]
+  last_seen_at       timestamptz [not null]
+
+  Indexes {
+    status         [name: 'idx_person_key_map_status']
+    merged_into_id [name: 'idx_person_key_map_merged_into']
+  }
+
+  Note: 'Stable internal_person_id per identity_signature. Reserved — not populated yet (identity resolution is deferred; see ADR-0007 / ADR-0010). Once populated it is an architectural cornerstone: cannot be reconstructed from S3 archive if lost (critical incident). CHECK constraint enforces (status=merged_into) <=> (merged_into_id IS NOT NULL); see V1__catalog_baseline.sql.'
+}
+
+Table catalog.merge_events {
+  event_id    bigserial [pk]
+  event_type  text [not null, note: "'pdl_merge' | 'identity_resolution_merge' | 'manual_merge'"]
+  losing_id   text [not null, note: 'pdl_id for pdl_merge; internal_person_id (as text) otherwise']
+  winning_id  text [not null]
+  observed_at timestamptz [not null]
+  notes       text [note: 'Free text, populated for manual_merge']
+
+  Indexes {
+    losing_id   [name: 'idx_merge_events_losing']
+    winning_id  [name: 'idx_merge_events_winning']
+    observed_at [name: 'idx_merge_events_observed']
+  }
+
+  Note: 'Append-only audit log of all merges (PDL-internal, identity-resolution, manual). Consumed by downstream merge feeds.'
+}
+
+// -----------------------------------------------------------------------------
+// Delivery state
+// -----------------------------------------------------------------------------
+
+Table catalog.pdl_delivery {
+  delivery_date         date [pk]
+  pdl_dataset_id        text [not null]
+  complete_md_seen_at   timestamptz [not null]
+  file_counts           jsonb [note: 'e.g. {"full": <n>, "merged": 1, "deleted": 1}']
+  row_counts            jsonb [note: 'Populated post-load']
+  status                text [not null, note: "'received' | 'processing' | 'success' | 'failed'"]
+  started_at            timestamptz
+  completed_at          timestamptz
+  error_message         text
+  pdl_merge_event_count int [note: 'From MERGED_RECORDS for this delivery']
+  pdl_deleted_count     int [note: 'From DELETED_RECORDS']
+  pdl_opted_out_count   int [note: 'From OPTED_OUT_RECORDS (when present); see OQ-3a in docs/requirements/01_pipeline_requirements.md']
+  created_at            timestamptz [not null]
+  updated_at            timestamptz [not null]
+
+  Note: 'One row per PDL delivery. Operational visibility under stateless content rebuild.'
+}
+
+// -----------------------------------------------------------------------------
+// Pipeline run tracking.
+// One pipeline_run per pipeline execution.
+// Universal across ALL workflow types (ingestion, dbt build, enrichment, downstream rebuild).
+// -----------------------------------------------------------------------------
+
+Table catalog.pipeline_run {
+  pipeline_run_id   uuid [pk, default: `gen_random_uuid()`, note: 'DB-assigned via the DEFAULT unless the caller mints one (e.g. a runner that pre-assigns the id before inserting).']
+  pipeline_name     text [not null, note: "e.g. 'pdl_full_load'"]
+  pipeline_version  text [not null]
+  parameters        jsonb [note: 'pipeline-specific args']
+  status            text [not null, note: "'running' | 'succeeded' | 'failed' | 'cancelled'"]
+  started_at        timestamptz [not null]
+  ended_at          timestamptz
+  // duration_ms is a STORED GENERATED column in V1__catalog_baseline.sql; DBML can't express the GENERATED expression directly.
+  // duration_ms       bigint   GENERATED ALWAYS AS ((EXTRACT(EPOCH FROM (ended_at - started_at)) * 1000)::BIGINT) STORED
+  failed_state_name text [note: 'which step caused the failure']
+  semantic_error    text [note: 'short ETL-meaningful summary (NOT stack trace; that lives in the process logs)']
+  created_at        timestamptz [not null]
+  updated_at        timestamptz [not null]
+
+  Note: 'One row per pipeline execution. Universal across all workflow types.'
+}
+
+// -----------------------------------------------------------------------------
+// Ingestion-specific tracking (linked upward into pipeline_run).
+// Cover the questions pipeline_run intentionally doesn't:
+// per-(source, delivery) summary and per-file detail with source vs destination row-count validation.
+// -----------------------------------------------------------------------------
+
+Table catalog.ingestion_run {
+  ingestion_run_id uuid [pk]
+  pipeline_run_id  uuid [not null, ref: > catalog.pipeline_run.pipeline_run_id]
+  source_name      text [not null]
+  delivery_date    date [not null]
+  sub_key          jsonb [note: 'Per-source sub-id within (source_name, delivery_date). Null for sources with no further partitioning.']
+  status           text [not null, note: "'started' | 'success' | 'failed'"]
+  started_at       timestamptz [not null]
+  ended_at         timestamptz
+  duration_seconds numeric
+  total_file_count int [note: 'Total files in this delivery']
+  total_row_count  bigint [note: 'Sum of ingestion_file.row_count']
+  total_bytes      bigint [note: 'Sum of ingestion_file.size_bytes']
+  error_message    text
+
+  Indexes {
+    pipeline_run_id [name: 'idx_ingestion_run_pipeline']
+    (source_name, delivery_date) [name: 'idx_ingestion_run_source_delivery']
+  }
+
+  Note: 'One row per (source, delivery) ingestion. FK to pipeline_run. Aggregates totals from ingestion_file. One Ingester process per delivery; intra-process concurrency loads multiple files in parallel from the single process.'
+}
+
+Table catalog.ingestion_file {
+  ingestion_file_id  uuid [pk]
+  ingestion_run_id   uuid [not null, ref: > catalog.ingestion_run.ingestion_run_id]
+  s3_key             text [not null]
+  target_table       text [not null, note: "Which raw table this file lands in (e.g. 'raw.pdl_person')"]
+  partition_value    text [not null, note: 'Partition value used (Python casts to partition column type when building leaf DDL). E.g. "42" for partition_id.']
+  expected_row_count bigint [note: 'Source-side row count (from the S3 manifest, when available)']
+  row_count          bigint [note: 'Destination-side row count (COUNT(*) on the leaf after load)']
+  size_bytes         bigint
+  status             text [not null, note: "'pending' | 'loading' | 'success' | 'failed'"]
+  load_started_at    timestamptz
+  load_ended_at      timestamptz
+  error_message      text
+
+  Indexes {
+    (ingestion_run_id, s3_key) [unique, name: 'ingestion_file_unique_key']
+    ingestion_run_id [name: 'idx_ingestion_file_run']
+  }
+
+  Note: 'One row per file in the delivery. Records both source-side (expected_row_count) and destination-side (row_count) for validation. Finder INSERTs with status=pending; Ingester UPDATEs with terminal status + row counts. The runner queries this table to decide pipeline_run terminal status.'
+}
