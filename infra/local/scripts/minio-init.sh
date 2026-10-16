@@ -21,7 +21,8 @@
 #   LOCAL_BUCKET         pdl-ingest-local
 #   DELIVERY_DATE        yyyy_mm_dd (set by `make dev-up-ingester` from the Makefile)
 #
-# Cached fixture: /cache/${FIXTURE_VERSION}.csv.gz (populated by fixture-load).
+# Cached fixture: /cache/${FIXTURE_VERSION}.csv.gz (populated by fixture-load —
+# by default a copy of the committed synthetic sample in infra/local/fixtures/).
 
 set -e
 

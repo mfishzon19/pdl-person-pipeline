@@ -70,7 +70,7 @@ make dev-up-ingester   # + MinIO with the fixture uploaded as a delivery; raw.* 
 make pipeline-pdl      # ingest-pdl (step 1) + dbt-pdl
 ```
 
-**Fixture.** No PDL data ships with the repo. The fixture loader looks for a sanitized PDL Person sample at `infra/local/fixtures-cache/pdl-person-sample-v1.csv.gz`, else downloads `FIXTURE_URL`, else skips (migrations still apply). Generate one from a delivery file you are licensed to use with `infra/local/scripts/sanitize-pdl-fixture.py`, which replaces PII with fake values while keeping the record shape.
+**Fixture.** The repo ships a small, **fully synthetic** PDL Person sample at `infra/local/fixtures/pdl-person-sample-v1.csv.gz` (~200 made-up people, fictional companies and schools on `.example` domains, real public geography), so `make dev-up` + `make dbt-pdl` work out of the box with no configuration. It is not PDL data; it only mimics the PDL record shape, and `infra/local/scripts/generate-sample-fixture.py` regenerates it deterministically. To use your own sample instead, set `FIXTURE_URL` (HTTPS `.csv.gz`) or drop the file at `infra/local/fixtures-cache/pdl-person-sample-v1.csv.gz`; the loader prefers the cache, then `FIXTURE_URL`, then the committed sample (run `make dev-reset` to switch). `infra/local/scripts/sanitize-pdl-fixture.py` turns a delivery file you are licensed to use into such a sample by replacing PII with fake values while keeping the record shape.
 
 **PDL API (step 3)** needs `PDL_API_KEY` and spends credits, so it never runs automatically: `make clean-pdl` drains the cleaner queues, `make enrich-pdl SOURCE_LIST=x MAX_CREDITS=n` runs a capped enrichment. See [`processing/pdl_api/README.md`](processing/pdl_api/README.md). **Cleansing (step 5)** routines run by hand with `psql -f`; see [`docs/pdl_data_cleansing/README.md`](docs/pdl_data_cleansing/README.md).
 
@@ -120,7 +120,7 @@ PDL and S3 are mocked in every unit and integration test. The live smoke tests i
 │   ├── common/                 Shared helpers: Postgres, S3, PDL HTTP client, delivery preflight checks, logging
 │   ├── dbt/                    Steps 2 + 4: dbt project (staging → ref → integration)
 │   └── tests/                  Cross-component tests
-├── infra/local/                Compose helper scripts, fixture cache, Postgres init, pgAdmin server definition
+├── infra/local/                Compose helper scripts, committed synthetic fixture, fixture cache, Postgres init, pgAdmin server definition
 ├── docker-compose.yml          postgres, flyway-init, fixture-load; profile `ingester`: minio, minio-init
 ├── Makefile                    Local entry points
 ├── environment.yml             Conda env `pdl_test`

@@ -90,9 +90,10 @@ services:
       PGDATABASE: pdl_etl
       # Cache file slug: the fixture is cached as ${FIXTURE_VERSION}.csv.gz.
       FIXTURE_VERSION: ${FIXTURE_VERSION:-pdl-person-sample-v1}
-      # Where to download the fixture from (HTTPS URL to a .csv.gz). No
-      # default — set it in your shell / .env, or drop the file into
-      # infra/local/fixtures-cache/ by hand. See fixture-load.sh.
+      # Optional override: HTTPS URL of your own fixture .csv.gz. Unset →
+      # the committed synthetic sample in infra/local/fixtures/ is used.
+      # Resolution order (see fixture-load.sh): cache → FIXTURE_URL →
+      # committed sample → skip.
       FIXTURE_URL: ${FIXTURE_URL:-}
       # If 1, skip the direct \copy into raw.pdl_person — just cache the
       # fixture for minio-init to upload. Set by `make dev-up-ingester`
@@ -103,6 +104,8 @@ services:
     volumes:
       - ./infra/local/scripts:/scripts:ro
       - ./infra/local/fixtures-cache:/cache
+      # Committed, fully synthetic sample (fallback when cache + URL are empty).
+      - ./infra/local/fixtures:/fixtures:ro
 
   # ──────────────────────────────────────────────────────────────────
   # Ingester profile — S3-compat object store for s3_ingester e2e work
